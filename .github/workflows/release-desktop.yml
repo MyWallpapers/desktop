@@ -57,17 +57,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Set dev build env vars
+        if: inputs.dev == true
+        shell: bash
+        run: |
+          echo "CARGO_PROFILE_RELEASE_OPT_LEVEL=0" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_LTO=false" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_STRIP=none" >> $GITHUB_ENV
+
       - name: Build and Publish Desktop App
         uses: tauri-apps/tauri-action@v0.5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Dev: disable all optimizations for fast builds
-          CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ inputs.dev == true && '0' || '' }}
-          CARGO_PROFILE_RELEASE_LTO: ${{ inputs.dev == true && 'false' || '' }}
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ inputs.dev == true && '16' || '' }}
-          CARGO_PROFILE_RELEASE_STRIP: ${{ inputs.dev == true && 'none' || '' }}
         with:
           tagName: v__VERSION__${{ inputs.dev == true && '-dev' || '' }}
           releaseName: "MyWallpaper Desktop v__VERSION__${{ inputs.dev == true && '-dev' || '' }}"
