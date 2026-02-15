@@ -36,6 +36,7 @@ pub struct DesktopIcon {
 // ============================================================================
 
 /// Decode percent-encoded characters in a URL path (e.g. %20 → space)
+#[cfg(target_os = "linux")]
 fn percent_decode(s: &str) -> String {
     let mut result = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -56,6 +57,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&result).into_owned()
 }
 
+#[cfg(target_os = "linux")]
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),

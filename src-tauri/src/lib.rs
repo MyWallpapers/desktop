@@ -14,6 +14,7 @@ use tracing_subscriber::FmtSubscriber;
 
 /// Build the __MW_INIT__ injection script (runs before page JS)
 fn mw_init_script() -> String {
+    #[allow(unused_mut)]
     let mut script = format!(
         r#"window.__MW_INIT__ = {{
             isTauri: true,
