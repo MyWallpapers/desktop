@@ -1,11 +1,16 @@
 name: Desktop Release
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
       dev:
         description: 'Dev build (no optimizations, devtools enabled, fast)'
         required: false
@@ -13,7 +18,57 @@ on:
         default: false
 
 jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bump version
+        id: bump
+        run: |
+          CURRENT=$(grep -oP '"version":\s*"\K[0-9]+\.[0-9]+\.[0-9]+' src-tauri/tauri.conf.json | head -1)
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          case "${{ inputs.bump }}" in
+            patch) PATCH=$((PATCH + 1)) ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+          esac
+
+          VERSION="$MAJOR.$MINOR.$PATCH"
+          SUFFIX="${{ inputs.dev == true && '-dev' || '' }}"
+          TAG="v${VERSION}${SUFFIX}"
+
+          echo "📦 $CURRENT → $VERSION (${{ inputs.bump }})"
+
+          # Update tauri.conf.json
+          sed -i "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
+
+          # Update Cargo.toml
+          sed -i "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+
+          # Update package.json
+          sed -i "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" package.json
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/tauri.conf.json src-tauri/Cargo.toml package.json
+          git commit -m "release: desktop v${{ steps.bump.outputs.version }}"
+          git tag "${{ steps.bump.outputs.tag }}"
+          git push origin main "${{ steps.bump.outputs.tag }}"
+
   publish-tauri:
+    needs: bump-version
     permissions:
       contents: write
     strategy:
@@ -32,6 +87,8 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -73,27 +130,24 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: v__VERSION__${{ inputs.dev == true && '-dev' || '' }}
-          releaseName: "MyWallpaper Desktop v__VERSION__${{ inputs.dev == true && '-dev' || '' }}"
+          tagName: ${{ needs.bump-version.outputs.tag }}
+          releaseName: "MyWallpaper Desktop ${{ needs.bump-version.outputs.tag }}"
           releaseBody: "See the assets to download this version and install.${{ inputs.dev == true && ' (DEV BUILD - unoptimized, devtools enabled)' || '' }}"
           releaseDraft: true
           prerelease: ${{ inputs.dev == true }}
           args: ${{ matrix.args }} ${{ inputs.dev == true && '--features devtools' || '' }}
 
   publish-release:
-    needs: publish-tauri
+    needs: [bump-version, publish-tauri]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="$(grep -oP '"version":\s*"\K[^"]+' src-tauri/tauri.conf.json | head -1)"
-          SUFFIX="${{ inputs.dev == true && '-dev' || '' }}"
-          echo "Publishing release v${VERSION}${SUFFIX}..."
-          gh release edit "v${VERSION}${SUFFIX}" --draft=false
-          echo "✅ Release v${VERSION}${SUFFIX} published!"
+          TAG="${{ needs.bump-version.outputs.tag }}"
+          echo "Publishing release ${TAG}..."
+          gh release edit "$TAG" --draft=false --repo ${{ github.repository }}
+          echo "✅ Release ${TAG} published!"
