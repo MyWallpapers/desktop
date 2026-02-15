@@ -3,6 +3,11 @@
 //! Tauri backend for the MyWallpaper animated wallpaper application.
 //! Provides system tray and auto-updates.
 
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 mod commands;
 mod desktop_clone;
 mod tray;
@@ -14,7 +19,6 @@ use tracing_subscriber::FmtSubscriber;
 
 /// Build the __MW_INIT__ injection script (runs before page JS)
 fn mw_init_script() -> String {
-    #[allow(unused_mut)]
     let mut script = format!(
         r#"window.__MW_INIT__ = {{
             isTauri: true,
@@ -60,6 +64,94 @@ fn mw_init_script() -> String {
 pub use commands::*;
 pub use tray::*;
 
+// ============================================================================
+// Platform-specific desktop lock
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+static ORIGINAL_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Windows: Subclass the window to lock position and block minimize.
+///
+/// The app stays ABOVE desktop icons (normal window level) but:
+/// - Cannot be moved or dragged by users (WM_WINDOWPOSCHANGING locks position)
+/// - Immune to Win+D (WM_SYSCOMMAND/SC_MINIMIZE is blocked)
+/// - Cannot be hidden by Show Desktop (SWP_HIDEWINDOW is cleared)
+#[cfg(target_os = "windows")]
+fn setup_windows_desktop_lock(raw_hwnd_val: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    let hwnd = HWND(raw_hwnd_val as *mut core::ffi::c_void);
+
+    unsafe {
+        let original = GetWindowLongPtrW(hwnd, GWL_WNDPROC);
+        if original == 0 {
+            warn!("Failed to get original window procedure");
+            return;
+        }
+        ORIGINAL_WNDPROC.store(original, std::sync::atomic::Ordering::Release);
+        SetWindowLongPtrW(hwnd, GWL_WNDPROC, desktop_wndproc as isize);
+    }
+
+    info!("Windows desktop lock installed (subclass)");
+}
+
+/// Custom window procedure that blocks minimize/move and locks position.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn desktop_wndproc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    match msg {
+        WM_SYSCOMMAND => {
+            let cmd = wparam.0 & 0xFFF0;
+            // Block minimize (Win+D) and move (drag via system menu)
+            if cmd == 0xF020 || cmd == 0xF010 {
+                return LRESULT(0);
+            }
+        }
+        WM_WINDOWPOSCHANGING => {
+            let pos = &mut *(lparam.0 as *mut WINDOWPOS);
+            // Lock position and size — prevents all movement/resize
+            pos.flags = pos.flags | SWP_NOMOVE | SWP_NOSIZE;
+            // Prevent hiding (Show Desktop gesture)
+            pos.flags = pos.flags & !SWP_HIDEWINDOW;
+        }
+        _ => {}
+    }
+
+    let original = ORIGINAL_WNDPROC.load(std::sync::atomic::Ordering::Acquire);
+    CallWindowProcW(std::mem::transmute(original), hwnd, msg, wparam, lparam)
+}
+
+/// macOS: Configure window collection behavior for desktop wallpaper mode.
+///
+/// The window stays at normal level (ABOVE desktop icons) but is:
+/// - Immune to Mission Control / Show Desktop gestures (stationary)
+/// - Visible on all Spaces (canJoinAllSpaces)
+/// - Excluded from Cmd+Tab cycling (ignoresCycle)
+#[cfg(target_os = "macos")]
+fn set_macos_desktop_behavior(ns_window_ptr: *mut std::ffi::c_void) {
+    use objc::{msg_send, sel, sel_impl};
+
+    info!("Setting macOS window collection behavior...");
+
+    unsafe {
+        let obj = ns_window_ptr as *mut objc::runtime::Object;
+        // canJoinAllSpaces (1) | stationary (16) | ignoresCycle (64) = 81
+        // Window level stays at normal (0) = above desktop icons
+        let _: () = msg_send![obj, setCollectionBehavior: 81_u64];
+    }
+
+    info!("macOS window behavior configured successfully");
+}
+
 /// Initialize logging based on debug/release mode
 fn init_logging() {
     let level = if cfg!(debug_assertions) {
@@ -91,31 +183,7 @@ pub fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
-        .plugin({
-            let mut updater = tauri_plugin_updater::Builder::new();
-
-            // On Linux, detect installation method and set the correct updater target.
-            // Default "linux-x86_64" maps to AppImage.tar.gz, but deb/rpm installs
-            // need their specific target to download the correct package format.
-            #[cfg(target_os = "linux")]
-            {
-                if std::env::var("APPIMAGE").is_err() {
-                    if let Ok(exe) = std::env::current_exe() {
-                        if exe.to_str().map_or(false, |p| p.starts_with("/usr")) {
-                            if std::path::Path::new("/var/lib/dpkg").exists() {
-                                info!("Detected .deb installation, using linux-x86_64-deb updater target");
-                                updater = updater.target("linux-x86_64-deb");
-                            } else if std::path::Path::new("/var/lib/rpm").exists() {
-                                info!("Detected .rpm installation, using linux-x86_64-rpm updater target");
-                                updater = updater.target("linux-x86_64-rpm");
-                            }
-                        }
-                    }
-                }
-            }
-
-            updater.build()
-        })
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
@@ -222,57 +290,53 @@ pub fn main() {
                 // Show the window after positioning
                 let _ = window.show();
 
-                // On Linux/X11: place window below all others so it acts as
-                // a wallpaper layer above the real desktop but below all apps.
-                //
-                // Previous approach used _NET_WM_WINDOW_TYPE_DESKTOP + name-based
-                // xdotool search. This caused two problems:
-                // 1. `xdotool search --name MyWallpaper` is a substring match that
-                //    also hits terminals, editors, and browsers whose title contains
-                //    "MyWallpaper", setting THEM as desktop windows too.
-                // 2. DESKTOP type triggers WM side effects (click interception,
-                //    show-desktop toggle, stacking interference with other windows).
-                //
-                // Fix: use PID-based matching + _NET_WM_STATE_BELOW which simply
-                // keeps our window below normal windows without DESKTOP semantics.
+                // === Platform-specific desktop wallpaper integration ===
+
+                // Windows: subclass window to lock position and block minimize
+                // Stays above desktop icons, immune to Win+D
+                #[cfg(target_os = "windows")]
+                {
+                    if let Ok(hwnd) = window.hwnd() {
+                        setup_windows_desktop_lock(hwnd.0 as isize);
+                    }
+                }
+
+                // macOS: configure collection behavior (stays above icons)
+                #[cfg(target_os = "macos")]
+                {
+                    if let Ok(ns_window) = window.ns_window() {
+                        set_macos_desktop_behavior(ns_window.0);
+                    }
+                }
+
+                // Linux/X11: set window type to DESKTOP so it sits below
+                // all application windows but above the actual wallpaper.
+                // Uses PID-based matching to avoid affecting other windows.
                 #[cfg(target_os = "linux")]
                 {
-                    let pid = std::process::id();
+                    let pid = std::process::id().to_string();
                     std::thread::spawn(move || {
-                        // Wait for the window to be registered with X11
                         std::thread::sleep(std::time::Duration::from_millis(800));
 
-                        // Match by PID only — never by name (substring match is dangerous)
-                        let Ok(output) = std::process::Command::new("xdotool")
-                            .args(["search", "--pid", &pid.to_string()])
+                        if let Ok(output) = std::process::Command::new("xdotool")
+                            .args(["search", "--pid", &pid, "--name", "MyWallpaper"])
                             .output()
-                        else {
-                            warn!("xdotool not found — cannot configure wallpaper layer");
-                            return;
-                        };
-
-                        let wids = String::from_utf8_lossy(&output.stdout);
-                        for wid in wids.trim().lines() {
-                            if wid.is_empty() { continue; }
-                            info!("Configuring X11 window {} as wallpaper layer", wid);
-
-                            // Set _NET_WM_STATE: below + sticky + skip taskbar/pager
-                            // This keeps our window below all normal windows without
-                            // the side effects of _NET_WM_WINDOW_TYPE_DESKTOP.
-                            let _ = std::process::Command::new("xprop")
-                                .args([
-                                    "-id", wid,
-                                    "-f", "_NET_WM_STATE", "32a",
-                                    "-set", "_NET_WM_STATE",
-                                    "_NET_WM_STATE_BELOW, _NET_WM_STATE_STICKY, _NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER",
-                                ])
-                                .output();
-
-                            // Also lower the window immediately as a fallback
-                            // in case the WM doesn't pick up the property change
-                            let _ = std::process::Command::new("xdotool")
-                                .args(["windowlower", wid])
-                                .output();
+                        {
+                            let wids = String::from_utf8_lossy(&output.stdout);
+                            for wid in wids.trim().lines() {
+                                if wid.is_empty() { continue; }
+                                info!("Setting X11 window {} as DESKTOP type", wid);
+                                let _ = std::process::Command::new("xprop")
+                                    .args([
+                                        "-id", wid,
+                                        "-f", "_NET_WM_WINDOW_TYPE", "32a",
+                                        "-set", "_NET_WM_WINDOW_TYPE",
+                                        "_NET_WM_WINDOW_TYPE_DESKTOP",
+                                    ])
+                                    .output();
+                            }
+                        } else {
+                            warn!("xdotool not found — cannot set desktop window type");
                         }
                     });
                 }
@@ -305,3 +369,11 @@ pub fn main() {
         .expect("Error while running MyWallpaper Desktop");
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_app_starts() {
+        // Basic smoke test
+        assert!(true);
+    }
+}

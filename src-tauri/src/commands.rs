@@ -116,8 +116,8 @@ pub async fn download_and_install_update(app: tauri::AppHandle) -> Result<(), St
         .download_and_install(
             |chunk_length, content_length| {
                 if let Some(len) = content_length {
-                    let percent = (chunk_length as f64 / len as f64 * 100.0) as u32;
-                    tracing::debug!("Download progress: {}%", percent);
+                    let _percent = (chunk_length as f64 / len as f64 * 100.0) as u32;
+                    tracing::debug!("Download progress: {}%", _percent);
                 }
             },
             || {
