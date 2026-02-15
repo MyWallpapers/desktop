@@ -1,0 +1,15 @@
+{
+  "name": "mywallpaper-desktop",
+  "version": "1.0.9",
+  "description": "MyWallpaper Desktop Application - Animated Wallpaper for Windows/macOS",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri:build:debug": "tauri build --debug"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

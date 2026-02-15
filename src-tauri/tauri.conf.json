@@ -1,0 +1,82 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MyWallpaper",
+  "identifier": "com.mywallpaper.desktop",
+  "version": "1.0.9",
+  "build": {
+    "beforeBuildCommand": "",
+    "beforeDevCommand": "",
+    "devUrl": "https://dev.mywallpaper.online",
+    "frontendDist": "https://dev.mywallpaper.online"
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": "v1Compatible",
+    "targets": ["msi", "nsis", "deb", "rpm", "appimage", "dmg", "app"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "displayLanguageSelector": false,
+        "installMode": "currentUser"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"]
+      }
+    }
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": "default-src 'self' https://dev.mywallpaper.online https://*.mywallpaper.online http://localhost:*; img-src 'self' data: https: http://localhost:*; media-src 'self' data: blob: https: http://localhost:*; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://dev.mywallpaper.online http://localhost:*; style-src 'self' 'unsafe-inline' https://dev.mywallpaper.online http://localhost:*; connect-src 'self' ipc: http://ipc.localhost https: wss: http://localhost:*; frame-src 'self' https: http://localhost:*;"
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "MyWallpaper",
+        "fullscreen": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": true,
+        "focus": false,
+        "visible": false,
+        "devtools": true
+      }
+    ],
+    "trayIcon": {
+      "iconPath": "icons/32x32.png",
+      "iconAsTemplate": true,
+      "menuOnLeftClick": false
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["mywallpaper"]
+      }
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFENzEzNjg3Q0FCMkJCMDgKUldRSXU3TEtoelp4cmVibkJndzFGSDNGUTZMTFdTRGlhTFVJL0VJdHF4cmJ3dlRLbUY1ZXd4aTMK",
+      "endpoints": [
+        "https://github.com/MyWallpapers/releases/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

@@ -1,0 +1,139 @@
+name: Desktop Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dev:
+        description: 'Dev build (no optimizations, devtools enabled, fast)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  # Step 1: Create a draft release on the Releases repo before building
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tauri.conf.json
+        id: version
+        run: echo "version=$(grep -oP '"version":\s*"\K[^"]+' src-tauri/tauri.conf.json | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="v${VERSION}"
+          SUFFIX="${{ inputs.dev == true && '-dev' || '' }}"
+
+          # Delete existing draft if present (re-run scenario)
+          EXISTING=$(gh release view "${TAG}${SUFFIX}" --repo MyWallpapers/releases --json isDraft --jq '.isDraft' 2>/dev/null || echo "")
+          if [ "$EXISTING" = "true" ]; then
+            echo "Deleting existing draft release ${TAG}${SUFFIX}..."
+            gh release delete "${TAG}${SUFFIX}" --repo MyWallpapers/releases --yes
+          fi
+
+          echo "Creating draft release ${TAG}${SUFFIX}..."
+          gh release create "${TAG}${SUFFIX}" \
+            --repo MyWallpapers/releases \
+            --title "MyWallpaper Desktop v${VERSION}${SUFFIX}" \
+            --notes "See the assets to download this version and install.${{ inputs.dev == true && ' (DEV BUILD - unoptimized, devtools enabled)' || '' }}" \
+            --draft \
+            ${{ inputs.dev == true && '--prerelease' || '' }}
+
+          echo "✅ Draft release ${TAG}${SUFFIX} created"
+
+  # Step 2: Build on all platforms and upload artifacts to the draft release
+  publish-tauri:
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "macos-latest"
+            args: "--target aarch64-apple-darwin"
+          - platform: "macos-latest"
+            args: "--target x86_64-apple-darwin"
+          - platform: "ubuntu-22.04"
+            args: ""
+          - platform: "windows-latest"
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install dependencies (ubuntu only)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and Publish Desktop App
+        uses: tauri-apps/tauri-action@v0.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Dev: disable all optimizations for fast builds
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ inputs.dev == true && '0' || '' }}
+          CARGO_PROFILE_RELEASE_LTO: ${{ inputs.dev == true && 'false' || '' }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ inputs.dev == true && '16' || '' }}
+          CARGO_PROFILE_RELEASE_STRIP: ${{ inputs.dev == true && 'none' || '' }}
+        with:
+          owner: MyWallpapers
+          repo: releases
+          tagName: v__VERSION__${{ inputs.dev == true && '-dev' || '' }}
+          releaseName: "MyWallpaper Desktop v__VERSION__${{ inputs.dev == true && '-dev' || '' }}"
+          releaseBody: "See the assets to download this version and install.${{ inputs.dev == true && ' (DEV BUILD - unoptimized, devtools enabled)' || '' }}"
+          releaseDraft: true
+          prerelease: ${{ inputs.dev == true }}
+          args: ${{ matrix.args }} ${{ inputs.dev == true && '--features devtools' || '' }}
+
+  # Step 3: Publish the draft release once all builds succeed
+  publish-release:
+    needs: publish-tauri
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+        run: |
+          VERSION="$(grep -oP '"version":\s*"\K[^"]+' src-tauri/tauri.conf.json | head -1)"
+          SUFFIX="${{ inputs.dev == true && '-dev' || '' }}"
+          echo "Publishing release v${VERSION}${SUFFIX}..."
+          gh release edit "v${VERSION}${SUFFIX}" --repo MyWallpapers/releases --draft=false
+          echo "✅ Release v${VERSION}${SUFFIX} published!"

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schema.tauri.app/config/2/capability",
+  "identifier": "default",
+  "description": "Default capabilities for MyWallpaper Desktop",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["https://dev.mywallpaper.online/*", "https://*.mywallpaper.online/*"]
+  },
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "process:default",
+    "autostart:default",
+    "updater:default",
+    "opener:default",
+    "deep-link:default"
+  ]
+}
