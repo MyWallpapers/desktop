@@ -19,6 +19,7 @@ use tracing_subscriber::FmtSubscriber;
 
 /// Build the __MW_INIT__ injection script (runs before page JS)
 fn mw_init_script() -> String {
+    #[allow(unused_mut)]
     let mut script = format!(
         r#"window.__MW_INIT__ = {{
             isTauri: true,
@@ -305,7 +306,7 @@ pub fn main() {
                 #[cfg(target_os = "macos")]
                 {
                     if let Ok(ns_window) = window.ns_window() {
-                        set_macos_desktop_behavior(ns_window.0);
+                        set_macos_desktop_behavior(ns_window);
                     }
                 }
 
