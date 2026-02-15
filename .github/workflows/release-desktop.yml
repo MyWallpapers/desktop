@@ -65,13 +65,6 @@ jobs:
           git tag "${{ steps.bump.outputs.tag }}"
           git push origin main "${{ steps.bump.outputs.tag }}"
 
-      - name: Update run title
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }} \
-            -X PATCH -f name="Release ${{ steps.bump.outputs.tag }} (${{ inputs.mode }})"
-
   publish-tauri:
     needs: bump-version
     permissions:
