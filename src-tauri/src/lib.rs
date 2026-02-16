@@ -69,70 +69,6 @@ pub use tray::*;
 // Platform-specific desktop wallpaper
 // ============================================================================
 
-/// Windows: Embed window in the desktop wallpaper layer using WorkerW.
-/// This is the same technique used by Wallpaper Engine, Lively, etc.
-/// The window sits behind desktop icons, immune to Win+D, covers full screen.
-#[cfg(target_os = "windows")]
-fn embed_in_desktop(raw_hwnd_val: isize) {
-    use windows::core::w;
-    use windows::Win32::Foundation::*;
-    use windows::Win32::UI::WindowsAndMessaging::*;
-
-    let our_hwnd = HWND(raw_hwnd_val as *mut core::ffi::c_void);
-
-    unsafe {
-        // 1. Find Progman (the desktop program manager)
-        let progman = FindWindowW(w!("Progman"), None);
-        if progman.0.is_null() {
-            warn!("Could not find Progman window");
-            return;
-        }
-
-        // 2. Tell Progman to spawn a WorkerW behind desktop icons
-        SendMessageTimeoutW(
-            progman, 0x052C, WPARAM(0xD), LPARAM(0x1),
-            SMTO_NORMAL, 1000, None,
-        );
-
-        // 3. Find the WorkerW that sits behind icons
-        let mut worker_w = HWND::default();
-        let _ = EnumWindows(
-            Some(find_worker_w),
-            LPARAM(&mut worker_w as *mut HWND as isize),
-        );
-
-        if worker_w.0.is_null() {
-            warn!("Could not find WorkerW window");
-            return;
-        }
-
-        // 4. Parent our window into WorkerW — done!
-        let _ = SetParent(our_hwnd, worker_w);
-        info!("Window embedded in desktop wallpaper layer");
-    }
-}
-
-/// EnumWindows callback: find the WorkerW behind SHELLDLL_DefView (the icon layer).
-#[cfg(target_os = "windows")]
-unsafe extern "system" fn find_worker_w(
-    hwnd: windows::Win32::Foundation::HWND,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::BOOL {
-    use windows::core::w;
-    use windows::Win32::Foundation::*;
-    use windows::Win32::UI::WindowsAndMessaging::*;
-
-    let shell = FindWindowExW(hwnd, None, w!("SHELLDLL_DefView"), None);
-    if !shell.0.is_null() {
-        let w = FindWindowExW(None, hwnd, w!("WorkerW"), None);
-        if !w.0.is_null() {
-            *(lparam.0 as *mut HWND) = w;
-            return BOOL(0); // Found it, stop
-        }
-    }
-    BOOL(1) // Continue searching
-}
-
 /// macOS: Configure window collection behavior for desktop wallpaper mode.
 ///
 /// The window stays at normal level (ABOVE desktop icons) but is:
@@ -295,11 +231,19 @@ pub fn main() {
 
                 // === Platform-specific desktop wallpaper integration ===
 
-                // Windows: embed in desktop wallpaper layer (WorkerW)
+                // Windows: fullscreen + WS_EX_TOOLWINDOW (immune to Win+D)
                 #[cfg(target_os = "windows")]
                 {
+                    let _ = window.set_fullscreen(true);
                     if let Ok(hwnd) = window.hwnd() {
-                        embed_in_desktop(hwnd.0 as isize);
+                        use windows::Win32::Foundation::HWND;
+                        use windows::Win32::UI::WindowsAndMessaging::*;
+                        let h = HWND(hwnd.0 as *mut core::ffi::c_void);
+                        unsafe {
+                            let style = GetWindowLongPtrW(h, GWL_EXSTYLE);
+                            SetWindowLongPtrW(h, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW.0 as isize);
+                        }
+                        info!("Windows: fullscreen + WS_EX_TOOLWINDOW set");
                     }
                 }
 
