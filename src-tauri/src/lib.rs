@@ -74,8 +74,8 @@ pub use tray::*;
 static ORIGINAL_WNDPROC: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-/// Windows: minimal window procedure that blocks "Show Desktop" (Win+D) from hiding this window.
-/// Only intercepts WM_WINDOWPOSCHANGING to strip the SWP_HIDEWINDOW flag.
+/// Windows: window procedure that blocks ALL paths "Show Desktop" (Win+D) uses to hide windows.
+/// Covers: WM_WINDOWPOSCHANGING (hide flag), WM_SYSCOMMAND (minimize), and WM_SIZE (minimized).
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn desktop_wndproc(
     hwnd: windows::Win32::Foundation::HWND,
@@ -85,10 +85,21 @@ unsafe extern "system" fn desktop_wndproc(
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::*;
 
+    // Block 1: Strip hide flag from position changes
     if msg == WM_WINDOWPOSCHANGING {
         let pos = &mut *(lparam.0 as *mut WINDOWPOS);
-        // Strip SWP_HIDEWINDOW — this is how Win+D hides windows
         pos.flags &= !SWP_HIDEWINDOW;
+    }
+
+    // Block 2: Reject minimize system commands (SC_MINIMIZE = 0xF020)
+    if msg == WM_SYSCOMMAND && (wparam.0 & 0xFFF0) == 0xF020 {
+        return windows::Win32::Foundation::LRESULT(0);
+    }
+
+    // Block 3: If somehow minimized, immediately restore
+    if msg == WM_SIZE && wparam.0 == 1 /* SIZE_MINIMIZED */ {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        return windows::Win32::Foundation::LRESULT(0);
     }
 
     let original = ORIGINAL_WNDPROC.load(std::sync::atomic::Ordering::SeqCst);
