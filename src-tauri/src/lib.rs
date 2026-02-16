@@ -71,21 +71,39 @@ pub use tray::*;
 
 #[cfg(target_os = "windows")]
 static ORIGINAL_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+#[cfg(target_os = "windows")]
+static LOCK_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+#[cfg(target_os = "windows")]
+static LOCK_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+#[cfg(target_os = "windows")]
+static LOCK_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+#[cfg(target_os = "windows")]
+static LOCK_H: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Windows: Subclass the window to lock position and block minimize.
 ///
 /// The app stays ABOVE desktop icons (normal window level) but:
-/// - Cannot be moved or dragged by users (WM_WINDOWPOSCHANGING locks position)
-/// - Immune to Win+D (WM_SYSCOMMAND/SC_MINIMIZE is blocked)
-/// - Cannot be hidden by Show Desktop (SWP_HIDEWINDOW is cleared)
+/// - Cannot be moved or dragged (WM_WINDOWPOSCHANGING forces exact position)
+/// - Immune to Win+D / Show Desktop (WS_EX_TOOLWINDOW + SC_MINIMIZE blocked)
+/// - Cannot be hidden by Show Desktop gesture (SWP_HIDEWINDOW is cleared)
 #[cfg(target_os = "windows")]
-fn setup_windows_desktop_lock(raw_hwnd_val: isize) {
+fn setup_windows_desktop_lock(raw_hwnd_val: isize, x: i32, y: i32, w: i32, h: i32) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::*;
+
+    // Store the exact target position/size for the window procedure
+    LOCK_X.store(x, std::sync::atomic::Ordering::Release);
+    LOCK_Y.store(y, std::sync::atomic::Ordering::Release);
+    LOCK_W.store(w, std::sync::atomic::Ordering::Release);
+    LOCK_H.store(h, std::sync::atomic::Ordering::Release);
 
     let hwnd = HWND(raw_hwnd_val as *mut core::ffi::c_void);
 
     unsafe {
+        // Add WS_EX_TOOLWINDOW — makes window immune to Win+D / Show Desktop
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOOLWINDOW.0 as isize);
+
         let original = GetWindowLongPtrW(hwnd, GWL_WNDPROC);
         if original == 0 {
             warn!("Failed to get original window procedure");
@@ -95,10 +113,10 @@ fn setup_windows_desktop_lock(raw_hwnd_val: isize) {
         SetWindowLongPtrW(hwnd, GWL_WNDPROC, desktop_wndproc as isize);
     }
 
-    info!("Windows desktop lock installed (subclass)");
+    info!("Windows desktop lock installed at ({}, {}) {}x{}", x, y, w, h);
 }
 
-/// Custom window procedure that blocks minimize/move and locks position.
+/// Custom window procedure that forces position and blocks minimize/hide.
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn desktop_wndproc(
     hwnd: windows::Win32::Foundation::HWND,
@@ -119,8 +137,13 @@ unsafe extern "system" fn desktop_wndproc(
         }
         WM_WINDOWPOSCHANGING => {
             let pos = &mut *(lparam.0 as *mut WINDOWPOS);
-            // Lock position and size — prevents all movement/resize
-            pos.flags = pos.flags | SWP_NOMOVE | SWP_NOSIZE;
+            // Force exact position and size to cover full monitor
+            pos.x = LOCK_X.load(std::sync::atomic::Ordering::Acquire);
+            pos.y = LOCK_Y.load(std::sync::atomic::Ordering::Acquire);
+            pos.cx = LOCK_W.load(std::sync::atomic::Ordering::Acquire);
+            pos.cy = LOCK_H.load(std::sync::atomic::Ordering::Acquire);
+            // Clear NOMOVE/NOSIZE so our position values are applied
+            pos.flags = pos.flags & !(SWP_NOMOVE | SWP_NOSIZE);
             // Prevent hiding (Show Desktop gesture)
             pos.flags = pos.flags & !SWP_HIDEWINDOW;
         }
@@ -298,7 +321,14 @@ pub fn main() {
                 #[cfg(target_os = "windows")]
                 {
                     if let Ok(hwnd) = window.hwnd() {
-                        setup_windows_desktop_lock(hwnd.0 as isize);
+                        let (mx, my, mw, mh) = if let Some(m) = window.primary_monitor().ok().flatten() {
+                            let s = m.size();
+                            let p = m.position();
+                            (p.x, p.y, s.width as i32, s.height as i32)
+                        } else {
+                            (0, 0, 1920, 1080)
+                        };
+                        setup_windows_desktop_lock(hwnd.0 as isize, mx, my, mw, mh);
                     }
                 }
 
