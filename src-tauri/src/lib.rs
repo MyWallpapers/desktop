@@ -66,68 +66,71 @@ pub use commands::*;
 pub use tray::*;
 
 // ============================================================================
-// Platform-specific desktop lock
+// Platform-specific desktop wallpaper
 // ============================================================================
 
+/// Windows: Embed window in the desktop wallpaper layer using WorkerW.
+/// This is the same technique used by Wallpaper Engine, Lively, etc.
+/// The window sits behind desktop icons, immune to Win+D, covers full screen.
 #[cfg(target_os = "windows")]
-static ORIGINAL_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
-
-/// Windows: Add WS_EX_TOOLWINDOW (Win+D immunity) and subclass to lock position.
-#[cfg(target_os = "windows")]
-fn setup_windows_desktop_lock(raw_hwnd_val: isize) {
-    use windows::Win32::Foundation::HWND;
+fn embed_in_desktop(raw_hwnd_val: isize) {
+    use windows::core::w;
+    use windows::Win32::Foundation::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    let hwnd = HWND(raw_hwnd_val as *mut core::ffi::c_void);
+    let our_hwnd = HWND(raw_hwnd_val as *mut core::ffi::c_void);
 
     unsafe {
-        // WS_EX_TOOLWINDOW: immune to Win+D / Show Desktop
-        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOOLWINDOW.0 as isize);
-
-        let original = GetWindowLongPtrW(hwnd, GWL_WNDPROC);
-        if original == 0 {
-            warn!("Failed to get original window procedure");
+        // 1. Find Progman (the desktop program manager)
+        let progman = FindWindowW(w!("Progman"), None);
+        if progman.0.is_null() {
+            warn!("Could not find Progman window");
             return;
         }
-        ORIGINAL_WNDPROC.store(original, std::sync::atomic::Ordering::Release);
-        SetWindowLongPtrW(hwnd, GWL_WNDPROC, desktop_wndproc as isize);
-    }
 
-    info!("Windows desktop lock installed");
+        // 2. Tell Progman to spawn a WorkerW behind desktop icons
+        SendMessageTimeoutW(
+            progman, 0x052C, WPARAM(0xD), LPARAM(0x1),
+            SMTO_NORMAL, 1000, None,
+        );
+
+        // 3. Find the WorkerW that sits behind icons
+        let mut worker_w = HWND::default();
+        let _ = EnumWindows(
+            Some(find_worker_w),
+            LPARAM(&mut worker_w as *mut HWND as isize),
+        );
+
+        if worker_w.0.is_null() {
+            warn!("Could not find WorkerW window");
+            return;
+        }
+
+        // 4. Parent our window into WorkerW — done!
+        let _ = SetParent(our_hwnd, worker_w);
+        info!("Window embedded in desktop wallpaper layer");
+    }
 }
 
-/// Custom window procedure that locks position and blocks minimize/hide.
+/// EnumWindows callback: find the WorkerW behind SHELLDLL_DefView (the icon layer).
 #[cfg(target_os = "windows")]
-unsafe extern "system" fn desktop_wndproc(
+unsafe extern "system" fn find_worker_w(
     hwnd: windows::Win32::Foundation::HWND,
-    msg: u32,
-    wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::Foundation::LRESULT;
+) -> windows::Win32::Foundation::BOOL {
+    use windows::core::w;
+    use windows::Win32::Foundation::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    match msg {
-        WM_SYSCOMMAND => {
-            let cmd = wparam.0 & 0xFFF0;
-            // Block minimize (Win+D) and move (drag via system menu)
-            if cmd == 0xF020 || cmd == 0xF010 {
-                return LRESULT(0);
-            }
+    let shell = FindWindowExW(hwnd, None, w!("SHELLDLL_DefView"), None);
+    if !shell.0.is_null() {
+        let w = FindWindowExW(None, hwnd, w!("WorkerW"), None);
+        if !w.0.is_null() {
+            *(lparam.0 as *mut HWND) = w;
+            return BOOL(0); // Found it, stop
         }
-        WM_WINDOWPOSCHANGING => {
-            let pos = &mut *(lparam.0 as *mut WINDOWPOS);
-            // Lock position and size
-            pos.flags = pos.flags | SWP_NOMOVE | SWP_NOSIZE;
-            // Prevent hiding (Show Desktop gesture)
-            pos.flags = pos.flags & !SWP_HIDEWINDOW;
-        }
-        _ => {}
     }
-
-    let original = ORIGINAL_WNDPROC.load(std::sync::atomic::Ordering::Acquire);
-    CallWindowProcW(std::mem::transmute(original), hwnd, msg, wparam, lparam)
+    BOOL(1) // Continue searching
 }
 
 /// macOS: Configure window collection behavior for desktop wallpaper mode.
@@ -276,26 +279,13 @@ pub fn main() {
                         size.width, size.height, position.x, position.y
                     );
 
-                    // Set window position and size to cover the entire screen.
-                    // Windows: oversize by 10px per side to cover DWM invisible borders.
-                    #[cfg(target_os = "windows")]
-                    {
-                        let _ = window.set_position(tauri::Position::Physical(
-                            tauri::PhysicalPosition::new(position.x - 10, position.y - 10)
-                        ));
-                        let _ = window.set_size(tauri::Size::Physical(
-                            tauri::PhysicalSize::new(size.width + 20, size.height + 20)
-                        ));
-                    }
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        let _ = window.set_position(tauri::Position::Physical(
-                            tauri::PhysicalPosition::new(position.x, position.y)
-                        ));
-                        let _ = window.set_size(tauri::Size::Physical(
-                            tauri::PhysicalSize::new(size.width, size.height)
-                        ));
-                    }
+                    // Set window position and size to cover the entire screen
+                    let _ = window.set_position(tauri::Position::Physical(
+                        tauri::PhysicalPosition::new(position.x, position.y)
+                    ));
+                    let _ = window.set_size(tauri::Size::Physical(
+                        tauri::PhysicalSize::new(size.width, size.height)
+                    ));
                 } else {
                     tracing::warn!("Could not detect primary monitor, using default size");
                 }
@@ -305,11 +295,11 @@ pub fn main() {
 
                 // === Platform-specific desktop wallpaper integration ===
 
-                // Windows: WS_EX_TOOLWINDOW + subclass to lock position and block Win+D
+                // Windows: embed in desktop wallpaper layer (WorkerW)
                 #[cfg(target_os = "windows")]
                 {
                     if let Ok(hwnd) = window.hwnd() {
-                        setup_windows_desktop_lock(hwnd.0 as isize);
+                        embed_in_desktop(hwnd.0 as isize);
                     }
                 }
 
