@@ -22,19 +22,17 @@ tauri-plugin-autostart = "2.0"
 tauri-plugin-deep-link = "2.0"
 tauri-plugin-opener = "2.0"
 tauri-plugin-single-instance = "2.0"
+tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 os_info = "3"
 typeshare = "1.0"
-base64 = "0.22"
-dirs = "5"
 ureq = "2"
 
 # Platform-specific dependencies
 [target.'cfg(windows)'.dependencies]
-winreg = "0.52"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
@@ -47,6 +45,14 @@ windows = { version = "0.58", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
+
+# Linux: CEF (Chromium Embedded Framework) for WebGPU support
+[target.'cfg(target_os = "linux")'.dependencies]
+cef = { git = "https://github.com/tauri-apps/cef-rs", default-features = false }
+download-cef = { git = "https://github.com/tauri-apps/cef-rs" }
+gtk = "0.18"
+glib = "0.18"
+dirs = "6"
 
 [features]
 default = ["custom-protocol"]

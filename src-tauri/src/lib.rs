@@ -1,7 +1,8 @@
 //! MyWallpaper Desktop Application
 //!
 //! Tauri backend for the MyWallpaper animated wallpaper application.
-//! Provides system tray and auto-updates.
+//! On Linux, uses CEF (Chromium Embedded Framework) instead of WebKitGTK
+//! to enable WebGPU via Vulkan.
 
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
@@ -9,18 +10,25 @@
 )]
 
 mod commands;
-mod desktop_clone;
+mod commands_core;
 mod tray;
+mod window_layer;
 
-use tauri::{Emitter, Listener, Manager};
-use tauri::webview::PageLoadEvent;
+#[cfg(target_os = "linux")]
+pub mod cef;
+
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-/// Build the __MW_INIT__ injection script (runs before page JS)
+// ============================================================================
+// Shared: __MW_INIT__ injection script
+// ============================================================================
+
+/// Build the __MW_INIT__ injection script (runs before page JS).
+/// Used by the Tauri webview path (Windows/macOS).
+#[cfg(not(target_os = "linux"))]
 fn mw_init_script() -> String {
-    #[allow(unused_mut)]
-    let mut script = format!(
+    format!(
         r#"window.__MW_INIT__ = {{
             isTauri: true,
             platform: "{}",
@@ -34,105 +42,11 @@ fn mw_init_script() -> String {
         env!("CARGO_PKG_VERSION"),
         tauri::VERSION,
         cfg!(debug_assertions),
-    );
-
-    // Linux/WebKitGTK: intercept fetch() calls to http://localhost so they go
-    // through a Tauri command instead of the webview network stack. WebKitGTK
-    // blocks HTTPS→HTTP mixed content; Chromium/WebView2 exempt localhost.
-    #[cfg(target_os = "linux")]
-    {
-        script.push_str(r#"
-(function() {
-    const _origFetch = window.fetch;
-    window.fetch = async function(input, init) {
-        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-        if (url && (url.startsWith('http://localhost') || url.startsWith('http://127.0.0.1'))) {
-            const r = await window.__TAURI__.core.invoke('proxy_fetch', { url });
-            return new Response(r.body, {
-                status: r.status,
-                headers: { 'content-type': r.content_type }
-            });
-        }
-        return _origFetch.call(this, input, init);
-    };
-})();
-"#);
-    }
-
-    script
+    )
 }
 
 pub use commands::*;
 pub use tray::*;
-
-// ============================================================================
-// Platform-specific desktop wallpaper
-// ============================================================================
-
-/// Windows: stored original window procedure for subclassing
-#[cfg(target_os = "windows")]
-static ORIGINAL_WNDPROC: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-/// Windows: window procedure that blocks ALL paths "Show Desktop" (Win+D) uses to hide windows.
-/// Covers: WM_WINDOWPOSCHANGING (hide flag), WM_SYSCOMMAND (minimize), and WM_SIZE (minimized).
-#[cfg(target_os = "windows")]
-unsafe extern "system" fn desktop_wndproc(
-    hwnd: windows::Win32::Foundation::HWND,
-    msg: u32,
-    wparam: windows::Win32::Foundation::WPARAM,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::*;
-
-    // Block 1: Strip hide flag from position changes
-    if msg == WM_WINDOWPOSCHANGING {
-        let pos = &mut *(lparam.0 as *mut WINDOWPOS);
-        pos.flags &= !SWP_HIDEWINDOW;
-    }
-
-    // Block 2: Reject minimize system commands (SC_MINIMIZE = 0xF020)
-    if msg == WM_SYSCOMMAND && (wparam.0 & 0xFFF0) == 0xF020 {
-        return windows::Win32::Foundation::LRESULT(0);
-    }
-
-    // Block 3: If somehow minimized, immediately restore
-    if msg == WM_SIZE && wparam.0 == 1 /* SIZE_MINIMIZED */ {
-        let _ = ShowWindow(hwnd, SW_RESTORE);
-        return windows::Win32::Foundation::LRESULT(0);
-    }
-
-    let original = ORIGINAL_WNDPROC.load(std::sync::atomic::Ordering::SeqCst);
-    CallWindowProcW(
-        std::mem::transmute(original),
-        hwnd,
-        msg,
-        wparam,
-        lparam,
-    )
-}
-
-/// macOS: Configure window collection behavior for desktop wallpaper mode.
-///
-/// The window stays at normal level (ABOVE desktop icons) but is:
-/// - Immune to Mission Control / Show Desktop gestures (stationary)
-/// - Visible on all Spaces (canJoinAllSpaces)
-/// - Excluded from Cmd+Tab cycling (ignoresCycle)
-#[cfg(target_os = "macos")]
-fn set_macos_desktop_behavior(ns_window_ptr: *mut std::ffi::c_void) {
-    use objc::{msg_send, sel, sel_impl};
-
-    info!("Setting macOS window collection behavior...");
-
-    unsafe {
-        let obj = ns_window_ptr as *mut objc::runtime::Object;
-        // canJoinAllSpaces (1) | stationary (16) | ignoresCycle (64) = 81
-        // Window level stays at normal (0) = above desktop icons
-        let _: () = msg_send![obj, setCollectionBehavior: 81_u64];
-    }
-
-    info!("macOS window behavior configured successfully");
-}
 
 /// Initialize logging based on debug/release mode
 fn init_logging() {
@@ -157,7 +71,30 @@ fn init_logging() {
 /// Main entry point
 pub fn main() {
     init_logging();
-    info!("Starting MyWallpaper Desktop v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Starting MyWallpaper Desktop v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        start_with_cef();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        start_with_tauri_webview();
+    }
+}
+
+// ============================================================================
+// Windows / macOS — standard Tauri webview
+// ============================================================================
+
+#[cfg(not(target_os = "linux"))]
+fn start_with_tauri_webview() {
+    use tauri::webview::PageLoadEvent;
+    use tauri::{Emitter, Listener, Manager};
 
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
@@ -167,23 +104,19 @@ pub fn main() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            // When a second instance is launched, it means we received a deep link
             info!("Single instance callback triggered with args: {:?}", args);
-
-            // Find the deep link URL in arguments
             for arg in args.iter() {
                 if arg.starts_with("mywallpaper://") {
                     info!("Deep link received via single-instance: {}", arg);
-                    // Emit event to frontend
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.emit("deep-link", arg.clone());
                     }
                 }
             }
         }))
-        // Inject __MW_INIT__ environment data before page scripts run
         .on_page_load(|webview, payload| {
             if payload.event() == PageLoadEvent::Started {
                 let _ = webview.eval(&mw_init_script());
@@ -191,7 +124,6 @@ pub fn main() {
         })
         .setup(|app| {
             info!("Application setup starting...");
-
             let handle = app.handle().clone();
 
             // Initialize system tray
@@ -199,37 +131,21 @@ pub fn main() {
                 tracing::error!("Failed to setup system tray: {}", e);
             }
 
-            // Register deep link scheme on Linux (required for dev mode)
-            // On macOS and Windows, this is handled by the bundle configuration
-            #[cfg(target_os = "linux")]
-            {
-                use tauri_plugin_deep_link::DeepLinkExt;
-                info!("Registering mywallpaper:// deep link scheme on Linux...");
-                match app.deep_link().register("mywallpaper") {
-                    Ok(_) => info!("Deep link scheme registered successfully"),
-                    Err(e) => warn!("Failed to register deep link scheme: {} (may already be registered)", e),
-                }
-            }
-
             // Listen for deep links via the deep-link plugin
             let deep_link_handle = handle.clone();
             app.listen("deep-link://new-url", move |event| {
                 let payload = event.payload();
                 info!("Deep link event received via plugin: {:?}", payload);
-
-                // Parse the URLs from the payload
                 if let Ok(urls) = serde_json::from_str::<Vec<String>>(payload) {
                     for url in urls {
                         if url.starts_with("mywallpaper://") {
                             info!("Processing deep link: {}", url);
-                            // Emit to frontend
                             if let Some(window) = deep_link_handle.get_webview_window("main") {
                                 if let Err(e) = window.emit("deep-link", url.clone()) {
                                     warn!("Failed to emit deep-link event: {}", e);
                                 } else {
                                     info!("Deep link emitted to frontend: {}", url);
                                 }
-                                // Bring window to front
                                 let _ = window.set_focus();
                             }
                         }
@@ -239,42 +155,31 @@ pub fn main() {
 
             // Setup window to cover full screen
             if let Some(window) = app.get_webview_window("main") {
-                // Set webview background per platform:
-                // - Windows/macOS: fully transparent (desktop shows through)
-                // - Linux: opaque dark (WebKitGTK has broken compositing with transparent windows)
+                // Windows/macOS: fully transparent background
                 use tauri::webview::Color;
-                #[cfg(target_os = "linux")]
-                let _ = window.set_background_color(Some(Color(10, 10, 11, 255)));
-                #[cfg(not(target_os = "linux"))]
                 let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
 
                 // Get primary monitor dimensions for fullscreen positioning
                 if let Some(monitor) = window.primary_monitor().ok().flatten() {
                     let size = monitor.size();
                     let position = monitor.position();
-
                     info!(
                         "Primary monitor: {}x{} at ({}, {})",
                         size.width, size.height, position.x, position.y
                     );
-
-                    // Set window position and size to cover the entire screen
                     let _ = window.set_position(tauri::Position::Physical(
-                        tauri::PhysicalPosition::new(position.x, position.y)
+                        tauri::PhysicalPosition::new(position.x, position.y),
                     ));
                     let _ = window.set_size(tauri::Size::Physical(
-                        tauri::PhysicalSize::new(size.width, size.height)
+                        tauri::PhysicalSize::new(size.width, size.height),
                     ));
                 } else {
-                    tracing::warn!("Could not detect primary monitor, using default size");
+                    warn!("Could not detect primary monitor, using default size");
                 }
 
-                // Show the window after positioning
                 let _ = window.show();
 
-                // === Platform-specific desktop wallpaper integration ===
-
-                // Windows: fullscreen + WS_EX_TOOLWINDOW + Win+D block
+                // Windows: fullscreen + WS_EX_TOOLWINDOW
                 #[cfg(target_os = "windows")]
                 {
                     let _ = window.set_fullscreen(true);
@@ -283,63 +188,340 @@ pub fn main() {
                         use windows::Win32::UI::WindowsAndMessaging::*;
                         let h = HWND(hwnd.0 as *mut core::ffi::c_void);
                         unsafe {
-                            // WS_EX_TOOLWINDOW: exclude from taskbar and Alt+Tab
                             let style = GetWindowLongPtrW(h, GWL_EXSTYLE);
-                            SetWindowLongPtrW(h, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW.0 as isize);
-
-                            // Subclass: block Win+D (Show Desktop) from hiding this window
-                            let original = SetWindowLongPtrW(h, GWLP_WNDPROC, desktop_wndproc as isize);
-                            ORIGINAL_WNDPROC.store(original as *mut _, std::sync::atomic::Ordering::SeqCst);
+                            SetWindowLongPtrW(
+                                h,
+                                GWL_EXSTYLE,
+                                style | WS_EX_TOOLWINDOW.0 as isize,
+                            );
                         }
-                        info!("Windows: fullscreen + WS_EX_TOOLWINDOW + Win+D block set");
+                        info!("Windows: fullscreen + WS_EX_TOOLWINDOW set (Interactive Mode)");
                     }
                 }
 
-                // macOS: configure collection behavior (stays above icons)
+                // macOS: configure collection behavior for Interactive Mode
                 #[cfg(target_os = "macos")]
                 {
                     if let Ok(ns_window) = window.ns_window() {
-                        set_macos_desktop_behavior(ns_window);
+                        window_layer::set_macos_interactive_mode(ns_window);
                     }
                 }
-
-                // Linux: use native fullscreen to guarantee full screen coverage
-                #[cfg(target_os = "linux")]
-                let _ = window.set_fullscreen(true);
             }
 
             info!("Application setup complete");
             Ok(())
         })
+        .manage(window_layer::WindowLayerState::new())
         .invoke_handler(tauri::generate_handler![
-            // System info
             commands::get_system_info,
-            // Auto-update commands
             commands::check_for_updates,
             commands::download_and_install_update,
             commands::restart_app,
-            // OAuth commands
             commands::open_oauth_in_browser,
-            // Window commands
             commands::reload_window,
-            // Layer management commands
             commands::get_layers,
             commands::toggle_layer,
-            // Desktop clone commands
-            desktop_clone::get_os_wallpaper,
-            desktop_clone::get_desktop_icons,
-            desktop_clone::open_desktop_item,
-            commands::proxy_fetch,
+            window_layer::set_window_layer,
+            window_layer::get_window_layer,
+            window_layer::toggle_window_layer,
+            window_layer::register_layer_shortcut,
+            window_layer::unregister_layer_shortcut,
         ])
         .run(tauri::generate_context!())
         .expect("Error while running MyWallpaper Desktop");
+}
+
+// ============================================================================
+// Linux — CEF + Tauri headless
+// ============================================================================
+
+#[cfg(target_os = "linux")]
+fn start_with_cef() {
+    use tauri::{Emitter, Listener, Manager};
+
+    info!("Linux: Starting with CEF (Chromium Embedded Framework)");
+
+    // Step 1: Ensure CEF binaries are available
+    if !cef::runtime::is_available() {
+        info!("CEF binaries not found, starting first-launch download...");
+        match cef::bootstrap::show_download_progress() {
+            Ok(path) => info!("CEF downloaded to {}", path.display()),
+            Err(e) => {
+                tracing::error!("CEF download failed: {}", e);
+                // Fall back to WebKitGTK (standard Tauri) if CEF download fails
+                warn!("Falling back to WebKitGTK webview");
+                start_with_tauri_webview_linux_fallback();
+                return;
+            }
+        }
+    }
+
+    // Step 2: Setup LD_LIBRARY_PATH for libcef.so
+    if let Err(e) = cef::runtime::setup_environment() {
+        tracing::error!("CEF environment setup failed: {}", e);
+        warn!("Falling back to WebKitGTK webview");
+        start_with_tauri_webview_linux_fallback();
+        return;
+    }
+
+    // Step 3: Initialize CEF
+    if let Err(e) = cef::browser::initialize() {
+        tracing::error!("CEF initialization failed: {}", e);
+        warn!("Falling back to WebKitGTK webview");
+        start_with_tauri_webview_linux_fallback();
+        return;
+    }
+
+    // Step 4: Start Tauri in headless mode (hidden window, tray, updater, shortcuts)
+    let tauri_app = tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            info!("Single instance callback (CEF mode): {:?}", args);
+            // Deep links: emit to CEF browser via JS eval
+            for arg in args.iter() {
+                if arg.starts_with("mywallpaper://") {
+                    info!("Deep link received: {}", arg);
+                    // TODO: Route to CEF browser via ProcessMessage
+                }
+            }
+        }))
+        .setup(|app| {
+            info!("Tauri headless setup starting (CEF mode)...");
+            let handle = app.handle().clone();
+
+            // Initialize system tray (works without visible webview)
+            if let Err(e) = tray::setup_tray(&handle) {
+                tracing::error!("Failed to setup system tray: {}", e);
+            }
+
+            // Register deep link scheme
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                info!("Registering mywallpaper:// deep link scheme...");
+                match app.deep_link().register("mywallpaper") {
+                    Ok(_) => info!("Deep link scheme registered"),
+                    Err(e) => warn!("Deep link registration failed: {} (may already exist)", e),
+                }
+            }
+
+            // Listen for deep links
+            let deep_link_handle = handle.clone();
+            app.listen("deep-link://new-url", move |event| {
+                let payload = event.payload();
+                info!("Deep link event (CEF mode): {:?}", payload);
+                // TODO: Route to CEF browser
+            });
+
+            // Hide the Tauri window — CEF provides the visible window
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
+
+            // Step 5: Create CEF browser window
+            let url = if cfg!(debug_assertions) {
+                "https://dev.mywallpaper.online"
+            } else {
+                "https://dev.mywallpaper.online"
+            };
+
+            if let Err(e) = cef::browser::create_browser(url) {
+                tracing::error!("Failed to create CEF browser: {}", e);
+            }
+
+            info!("Tauri headless setup complete (CEF mode)");
+            Ok(())
+        })
+        .manage(window_layer::WindowLayerState::new())
+        .invoke_handler(tauri::generate_handler![
+            commands::get_system_info,
+            commands::check_for_updates,
+            commands::download_and_install_update,
+            commands::restart_app,
+            commands::open_oauth_in_browser,
+            commands::reload_window,
+            commands::get_layers,
+            commands::toggle_layer,
+            window_layer::set_window_layer,
+            window_layer::get_window_layer,
+            window_layer::toggle_window_layer,
+            window_layer::register_layer_shortcut,
+            window_layer::unregister_layer_shortcut,
+        ])
+        .build(tauri::generate_context!())
+        .expect("Error building Tauri app in CEF mode");
+
+    // Run with CEF message pump integration
+    // Tauri's run() on Linux uses GTK internally, which shares the glib main loop.
+    // CEF's external_message_pump hooks into the same glib loop via
+    // on_schedule_message_pump_work → glib::idle_add_local / glib::timeout_add_local
+    tauri_app.run(|_app, _event| {
+        // CEF message pumping happens via glib integration in app.rs
+    });
+
+    // Cleanup
+    cef::browser::shutdown_cef();
+}
+
+/// Fallback: run standard Tauri with WebKitGTK on Linux if CEF fails.
+/// This is the original behavior before CEF integration.
+#[cfg(target_os = "linux")]
+fn start_with_tauri_webview_linux_fallback() {
+    use tauri::webview::PageLoadEvent;
+    use tauri::{Emitter, Listener, Manager};
+
+    warn!("Running with WebKitGTK fallback (WebGPU may not work)");
+
+    // Inline the __MW_INIT__ script for Linux fallback
+    let init_script = format!(
+        r#"window.__MW_INIT__ = {{
+            isTauri: true,
+            platform: "{}",
+            arch: "{}",
+            appVersion: "{}",
+            tauriVersion: "{}",
+            debug: {}
+        }};
+(function() {{
+    const _origFetch = window.fetch;
+    window.fetch = async function(input, init) {{
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (url && (url.startsWith('http://localhost') || url.startsWith('http://127.0.0.1'))) {{
+            const r = await window.__TAURI__.core.invoke('proxy_fetch', {{ url }});
+            return new Response(r.body, {{
+                status: r.status,
+                headers: {{ 'content-type': r.content_type }}
+            }});
+        }}
+        return _origFetch.call(this, input, init);
+    }};
+}})();"#,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        env!("CARGO_PKG_VERSION"),
+        tauri::VERSION,
+        cfg!(debug_assertions),
+    );
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            info!("Single instance callback triggered with args: {:?}", args);
+            for arg in args.iter() {
+                if arg.starts_with("mywallpaper://") {
+                    info!("Deep link received via single-instance: {}", arg);
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.emit("deep-link", arg.clone());
+                    }
+                }
+            }
+        }))
+        .on_page_load(move |webview, payload| {
+            if payload.event() == PageLoadEvent::Started {
+                let _ = webview.eval(&init_script);
+            }
+        })
+        .setup(|app| {
+            info!("Application setup starting (WebKitGTK fallback)...");
+            let handle = app.handle().clone();
+
+            if let Err(e) = tray::setup_tray(&handle) {
+                tracing::error!("Failed to setup system tray: {}", e);
+            }
+
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                info!("Registering mywallpaper:// deep link scheme on Linux...");
+                match app.deep_link().register("mywallpaper") {
+                    Ok(_) => info!("Deep link scheme registered successfully"),
+                    Err(e) => warn!(
+                        "Failed to register deep link scheme: {} (may already be registered)",
+                        e
+                    ),
+                }
+            }
+
+            let deep_link_handle = handle.clone();
+            app.listen("deep-link://new-url", move |event| {
+                let payload = event.payload();
+                info!("Deep link event received via plugin: {:?}", payload);
+                if let Ok(urls) = serde_json::from_str::<Vec<String>>(payload) {
+                    for url in urls {
+                        if url.starts_with("mywallpaper://") {
+                            info!("Processing deep link: {}", url);
+                            if let Some(window) = deep_link_handle.get_webview_window("main") {
+                                if let Err(e) = window.emit("deep-link", url.clone()) {
+                                    warn!("Failed to emit deep-link event: {}", e);
+                                }
+                                let _ = window.set_focus();
+                            }
+                        }
+                    }
+                }
+            });
+
+            if let Some(window) = app.get_webview_window("main") {
+                use tauri::webview::Color;
+                let _ = window.set_background_color(Some(Color(10, 10, 11, 255)));
+
+                if let Some(monitor) = window.primary_monitor().ok().flatten() {
+                    let size = monitor.size();
+                    let position = monitor.position();
+                    let _ = window.set_position(tauri::Position::Physical(
+                        tauri::PhysicalPosition::new(position.x, position.y),
+                    ));
+                    let _ = window.set_size(tauri::Size::Physical(
+                        tauri::PhysicalSize::new(size.width, size.height),
+                    ));
+                }
+
+                let _ = window.show();
+                let _ = window.set_fullscreen(true);
+            }
+
+            info!("Application setup complete (WebKitGTK fallback)");
+            Ok(())
+        })
+        .manage(window_layer::WindowLayerState::new())
+        .invoke_handler(tauri::generate_handler![
+            commands::get_system_info,
+            commands::check_for_updates,
+            commands::download_and_install_update,
+            commands::restart_app,
+            commands::open_oauth_in_browser,
+            commands::reload_window,
+            commands::get_layers,
+            commands::toggle_layer,
+            window_layer::set_window_layer,
+            window_layer::get_window_layer,
+            window_layer::toggle_window_layer,
+            window_layer::register_layer_shortcut,
+            window_layer::unregister_layer_shortcut,
+            commands::proxy_fetch,
+        ])
+        .run(tauri::generate_context!())
+        .expect("Error while running MyWallpaper Desktop (WebKitGTK fallback)");
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn test_app_starts() {
-        // Basic smoke test
         assert!(true);
     }
 }

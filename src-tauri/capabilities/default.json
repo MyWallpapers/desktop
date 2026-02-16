@@ -13,6 +13,7 @@
     "autostart:default",
     "updater:default",
     "opener:default",
-    "deep-link:default"
+    "deep-link:default",
+    "global-shortcut:default"
   ]
 }
