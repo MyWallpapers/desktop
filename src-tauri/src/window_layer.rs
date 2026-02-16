@@ -104,10 +104,7 @@ pub fn toggle_window_layer(
 
 /// Register a global shortcut that toggles the window layer mode
 #[tauri::command]
-pub fn register_layer_shortcut(
-    app: tauri::AppHandle,
-    shortcut: String,
-) -> Result<(), String> {
+pub fn register_layer_shortcut(app: tauri::AppHandle, shortcut: String) -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
     info!("Registering layer toggle shortcut: {}", shortcut);
@@ -117,10 +114,7 @@ pub fn register_layer_shortcut(
         .map_err(|e| format!("Invalid shortcut '{}': {}", shortcut, e))?;
 
     // Check if already registered
-    if app
-        .global_shortcut()
-        .is_registered(parsed)
-    {
+    if app.global_shortcut().is_registered(parsed) {
         info!("Shortcut {} already registered, skipping", shortcut);
         return Ok(());
     }
@@ -161,10 +155,7 @@ pub fn register_layer_shortcut(
 
 /// Unregister a previously registered layer shortcut
 #[tauri::command]
-pub fn unregister_layer_shortcut(
-    app: tauri::AppHandle,
-    shortcut: String,
-) -> Result<(), String> {
+pub fn unregister_layer_shortcut(app: tauri::AppHandle, shortcut: String) -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
     info!("Unregistering layer shortcut: {}", shortcut);
@@ -184,10 +175,7 @@ pub fn unregister_layer_shortcut(
 // Platform-specific layer mode application
 // ============================================================================
 
-fn apply_layer_mode(
-    window: &tauri::WebviewWindow,
-    mode: WindowLayerMode,
-) -> Result<(), String> {
+fn apply_layer_mode(window: &tauri::WebviewWindow, mode: WindowLayerMode) -> Result<(), String> {
     match mode {
         WindowLayerMode::Desktop => apply_desktop_mode(window),
         WindowLayerMode::Interactive => apply_interactive_mode(window),
@@ -208,10 +196,8 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
 
     unsafe {
         // 1. Find Progman
-        let progman = FindWindowW(
-            windows::core::w!("Progman"),
-            None,
-        ).map_err(|_| "Could not find Progman window".to_string())?;
+        let progman = FindWindowW(windows::core::w!("Progman"), None)
+            .map_err(|_| "Could not find Progman window".to_string())?;
         if progman.is_invalid() {
             return Err("Could not find Progman window".to_string());
         }
@@ -248,10 +234,17 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
             let data = &mut *(lparam.0 as *mut EnumData);
             // Check if this window has a child called SHELLDLL_DefView
-            if let Ok(def_view) = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None) {
+            if let Ok(def_view) = FindWindowExW(
+                hwnd,
+                HWND::default(),
+                windows::core::w!("SHELLDLL_DefView"),
+                None,
+            ) {
                 if !def_view.is_invalid() {
                     // The WorkerW we want is the NEXT one after this one
-                    if let Ok(worker) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
+                    if let Ok(worker) =
+                        FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None)
+                    {
                         data.worker_w = worker;
                     }
                 }
@@ -290,7 +283,11 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
 
         // Remove WS_EX_TOOLWINDOW since we're behind icons now
         let style = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(our_hwnd, GWL_EXSTYLE, style & !(WS_EX_TOOLWINDOW.0 as isize));
+        SetWindowLongPtrW(
+            our_hwnd,
+            GWL_EXSTYLE,
+            style & !(WS_EX_TOOLWINDOW.0 as isize),
+        );
 
         info!("Windows: Desktop Mode applied (reparented into WorkerW)");
     }

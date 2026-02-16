@@ -6,13 +6,12 @@ use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
     tray::{TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
 use tracing::{debug, info};
 
 /// Emit a tray action to the Tauri webview window.
 fn emit_tray_action(app: &AppHandle, action: &str) {
-    use tauri::Emitter;
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
@@ -24,9 +23,8 @@ fn emit_tray_action(app: &AppHandle, action: &str) {
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     info!("Setting up system tray...");
 
-    let icon = Image::from_bytes(include_bytes!("../icons/32x32.png")).unwrap_or_else(|_| {
-        Image::new_owned(vec![255u8; 32 * 32 * 4], 32, 32)
-    });
+    let icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))
+        .unwrap_or_else(|_| Image::new_owned(vec![255u8; 32 * 32 * 4], 32, 32));
 
     // Layers submenu (dynamically populated via frontend events)
     let layers_placeholder = MenuItemBuilder::with_id("layers_placeholder", "No layers loaded")
@@ -91,7 +89,6 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                     // Handle dynamic layer toggle items (prefixed with "layer_")
                     if let Some(layer_id) = id.strip_prefix("layer_") {
                         info!("Toggle layer from tray: {}", layer_id);
-                        use tauri::Emitter;
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.emit("tray-toggle-layer", layer_id);
                         }

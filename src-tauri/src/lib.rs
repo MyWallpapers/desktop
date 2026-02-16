@@ -3,11 +3,6 @@
 //! Tauri backend for the MyWallpaper animated wallpaper application.
 //! Currently supports Windows and macOS. Linux support is paused.
 
-#![cfg_attr(
-    all(not(debug_assertions), target_os = "windows"),
-    windows_subsystem = "windows"
-)]
-
 mod commands;
 mod commands_core;
 mod tray;
@@ -36,7 +31,6 @@ fn mw_init_script() -> String {
 }
 
 pub use commands::*;
-pub use tray::*;
 
 /// Initialize logging based on debug/release mode
 fn init_logging() {
@@ -54,8 +48,7 @@ fn init_logging() {
         .with_line_number(cfg!(debug_assertions))
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set tracing subscriber");
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 }
 
 /// Main entry point
@@ -100,7 +93,7 @@ fn start_with_tauri_webview() {
         }))
         .on_page_load(|webview, payload| {
             if payload.event() == PageLoadEvent::Started {
-                let _ = webview.eval(&mw_init_script());
+                let _ = webview.eval(mw_init_script());
             }
         })
         .setup(|app| {
@@ -151,9 +144,10 @@ fn start_with_tauri_webview() {
                     let _ = window.set_position(tauri::Position::Physical(
                         tauri::PhysicalPosition::new(position.x, position.y),
                     ));
-                    let _ = window.set_size(tauri::Size::Physical(
-                        tauri::PhysicalSize::new(size.width, size.height),
-                    ));
+                    let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(
+                        size.width,
+                        size.height,
+                    )));
                 } else {
                     warn!("Could not detect primary monitor, using default size");
                 }
@@ -170,11 +164,7 @@ fn start_with_tauri_webview() {
                         let h = HWND(hwnd.0 as *mut core::ffi::c_void);
                         unsafe {
                             let style = GetWindowLongPtrW(h, GWL_EXSTYLE);
-                            SetWindowLongPtrW(
-                                h,
-                                GWL_EXSTYLE,
-                                style | WS_EX_TOOLWINDOW.0 as isize,
-                            );
+                            SetWindowLongPtrW(h, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW.0 as isize);
                         }
                         info!("Windows: fullscreen + WS_EX_TOOLWINDOW set (Interactive Mode)");
                     }

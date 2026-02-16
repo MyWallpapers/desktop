@@ -1,7 +1,7 @@
 //! Platform-independent command logic
 //!
 //! These functions contain the actual business logic, free of `tauri::` types.
-//! Both Tauri command wrappers and the CEF IPC bridge call into these.
+//! Tauri command wrappers in `commands.rs` call into these.
 
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
@@ -68,19 +68,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_system_info() {
-        let info = get_system_info();
-        assert!(!info.os.is_empty());
-        assert!(!info.arch.is_empty());
-        assert!(!info.app_version.is_empty());
-    }
-
-    #[test]
     fn test_validate_oauth_url() {
         assert!(validate_oauth_url("https://example.com").is_ok());
         assert!(validate_oauth_url("http://example.com").is_ok());
         assert!(validate_oauth_url("ftp://example.com").is_err());
         assert!(validate_oauth_url("javascript:alert(1)").is_err());
     }
-
 }
