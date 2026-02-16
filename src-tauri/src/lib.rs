@@ -71,36 +71,17 @@ pub use tray::*;
 
 #[cfg(target_os = "windows")]
 static ORIGINAL_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
-#[cfg(target_os = "windows")]
-static LOCK_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-#[cfg(target_os = "windows")]
-static LOCK_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-#[cfg(target_os = "windows")]
-static LOCK_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-#[cfg(target_os = "windows")]
-static LOCK_H: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-/// Windows: Subclass the window to lock position and block minimize.
-///
-/// The app stays ABOVE desktop icons (normal window level) but:
-/// - Cannot be moved or dragged (WM_WINDOWPOSCHANGING forces exact position)
-/// - Immune to Win+D / Show Desktop (WS_EX_TOOLWINDOW + SC_MINIMIZE blocked)
-/// - Cannot be hidden by Show Desktop gesture (SWP_HIDEWINDOW is cleared)
+/// Windows: Add WS_EX_TOOLWINDOW (Win+D immunity) and subclass to lock position.
 #[cfg(target_os = "windows")]
-fn setup_windows_desktop_lock(raw_hwnd_val: isize, x: i32, y: i32, w: i32, h: i32) {
+fn setup_windows_desktop_lock(raw_hwnd_val: isize) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::*;
-
-    // Store the exact target position/size for the window procedure
-    LOCK_X.store(x, std::sync::atomic::Ordering::Release);
-    LOCK_Y.store(y, std::sync::atomic::Ordering::Release);
-    LOCK_W.store(w, std::sync::atomic::Ordering::Release);
-    LOCK_H.store(h, std::sync::atomic::Ordering::Release);
 
     let hwnd = HWND(raw_hwnd_val as *mut core::ffi::c_void);
 
     unsafe {
-        // Add WS_EX_TOOLWINDOW — makes window immune to Win+D / Show Desktop
+        // WS_EX_TOOLWINDOW: immune to Win+D / Show Desktop
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOOLWINDOW.0 as isize);
 
@@ -113,10 +94,10 @@ fn setup_windows_desktop_lock(raw_hwnd_val: isize, x: i32, y: i32, w: i32, h: i3
         SetWindowLongPtrW(hwnd, GWL_WNDPROC, desktop_wndproc as isize);
     }
 
-    info!("Windows desktop lock installed at ({}, {}) {}x{}", x, y, w, h);
+    info!("Windows desktop lock installed");
 }
 
-/// Custom window procedure that forces position and blocks minimize/hide.
+/// Custom window procedure that locks position and blocks minimize/hide.
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn desktop_wndproc(
     hwnd: windows::Win32::Foundation::HWND,
@@ -137,13 +118,8 @@ unsafe extern "system" fn desktop_wndproc(
         }
         WM_WINDOWPOSCHANGING => {
             let pos = &mut *(lparam.0 as *mut WINDOWPOS);
-            // Force exact position and size to cover full monitor
-            pos.x = LOCK_X.load(std::sync::atomic::Ordering::Acquire);
-            pos.y = LOCK_Y.load(std::sync::atomic::Ordering::Acquire);
-            pos.cx = LOCK_W.load(std::sync::atomic::Ordering::Acquire);
-            pos.cy = LOCK_H.load(std::sync::atomic::Ordering::Acquire);
-            // Clear NOMOVE/NOSIZE so our position values are applied
-            pos.flags = pos.flags & !(SWP_NOMOVE | SWP_NOSIZE);
+            // Lock position and size
+            pos.flags = pos.flags | SWP_NOMOVE | SWP_NOSIZE;
             // Prevent hiding (Show Desktop gesture)
             pos.flags = pos.flags & !SWP_HIDEWINDOW;
         }
@@ -300,13 +276,26 @@ pub fn main() {
                         size.width, size.height, position.x, position.y
                     );
 
-                    // Set window position and size to cover the entire screen
-                    let _ = window.set_position(tauri::Position::Physical(
-                        tauri::PhysicalPosition::new(position.x, position.y)
-                    ));
-                    let _ = window.set_size(tauri::Size::Physical(
-                        tauri::PhysicalSize::new(size.width, size.height)
-                    ));
+                    // Set window position and size to cover the entire screen.
+                    // Windows: oversize by 10px per side to cover DWM invisible borders.
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = window.set_position(tauri::Position::Physical(
+                            tauri::PhysicalPosition::new(position.x - 10, position.y - 10)
+                        ));
+                        let _ = window.set_size(tauri::Size::Physical(
+                            tauri::PhysicalSize::new(size.width + 20, size.height + 20)
+                        ));
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        let _ = window.set_position(tauri::Position::Physical(
+                            tauri::PhysicalPosition::new(position.x, position.y)
+                        ));
+                        let _ = window.set_size(tauri::Size::Physical(
+                            tauri::PhysicalSize::new(size.width, size.height)
+                        ));
+                    }
                 } else {
                     tracing::warn!("Could not detect primary monitor, using default size");
                 }
@@ -316,19 +305,11 @@ pub fn main() {
 
                 // === Platform-specific desktop wallpaper integration ===
 
-                // Windows: subclass window to lock position and block minimize
-                // Stays above desktop icons, immune to Win+D
+                // Windows: WS_EX_TOOLWINDOW + subclass to lock position and block Win+D
                 #[cfg(target_os = "windows")]
                 {
                     if let Ok(hwnd) = window.hwnd() {
-                        let (mx, my, mw, mh) = if let Some(m) = window.primary_monitor().ok().flatten() {
-                            let s = m.size();
-                            let p = m.position();
-                            (p.x, p.y, s.width as i32, s.height as i32)
-                        } else {
-                            (0, 0, 1920, 1080)
-                        };
-                        setup_windows_desktop_lock(hwnd.0 as isize, mx, my, mw, mh);
+                        setup_windows_desktop_lock(hwnd.0 as isize);
                     }
                 }
 
