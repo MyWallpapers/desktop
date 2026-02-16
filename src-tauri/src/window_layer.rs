@@ -3,12 +3,10 @@
 //! Desktop Mode: window placed BEHIND desktop icons (immune to Win+D / Cmd+F3).
 //!   - Windows: reparent into WorkerW (behind SHELLDLL_DefView)
 //!   - macOS: set window level to kCGDesktopWindowLevel, ignore mouse events
-//!   - Linux (X11): set _NET_WM_WINDOW_TYPE to _NET_WM_WINDOW_TYPE_DESKTOP
 //!
 //! Interactive Mode: window on top of everything (current behavior).
 //!   - Windows: detach from WorkerW, fullscreen + WS_EX_TOOLWINDOW
 //!   - macOS: normal window level, accept mouse events
-//!   - Linux: set _NET_WM_WINDOW_TYPE to _NET_WM_WINDOW_TYPE_NORMAL, fullscreen
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -201,7 +199,7 @@ fn apply_layer_mode(
 
 #[cfg(target_os = "windows")]
 fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     let our_hwnd = window
@@ -214,7 +212,7 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         let progman = FindWindowW(
             windows::core::w!("Progman"),
             None,
-        );
+        ).map_err(|_| "Could not find Progman window".to_string())?;
         if progman.is_invalid() {
             return Err("Could not find Progman window".to_string());
         }
@@ -251,10 +249,13 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
             let data = &mut *(lparam.0 as *mut EnumData);
             // Check if this window has a child called SHELLDLL_DefView
-            let def_view = FindWindowExW(hwnd, None, windows::core::w!("SHELLDLL_DefView"), None);
-            if !def_view.is_invalid() {
-                // The WorkerW we want is the NEXT one after this one
-                data.worker_w = FindWindowExW(None, hwnd, windows::core::w!("WorkerW"), None);
+            if let Ok(def_view) = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None) {
+                if !def_view.is_invalid() {
+                    // The WorkerW we want is the NEXT one after this one
+                    if let Ok(worker) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
+                        data.worker_w = worker;
+                    }
+                }
             }
             BOOL(1) // continue enumeration
         }
@@ -271,7 +272,7 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         info!("Found WorkerW: {:?}", data.worker_w);
 
         // 4. Reparent our window into WorkerW
-        let _ = SetParent(our_hwnd, Some(data.worker_w));
+        let _ = SetParent(our_hwnd, data.worker_w);
 
         // 5. Remove fullscreen (conflicts with reparenting) and resize to cover WorkerW
         let _ = window.set_fullscreen(false);
@@ -280,7 +281,7 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         let _ = GetClientRect(data.worker_w, &mut rect);
         let _ = SetWindowPos(
             our_hwnd,
-            None,
+            HWND::default(),
             0,
             0,
             rect.right - rect.left,
@@ -310,7 +311,7 @@ fn apply_interactive_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
 
     unsafe {
         // Detach from WorkerW (reparent to desktop/null)
-        let _ = SetParent(our_hwnd, None);
+        let _ = SetParent(our_hwnd, HWND::default());
 
         // Restore fullscreen + WS_EX_TOOLWINDOW
         let _ = window.set_fullscreen(true);
@@ -378,81 +379,6 @@ pub fn set_macos_interactive_mode(ns_window_ptr: *mut std::ffi::c_void) {
     }
 
     info!("macOS: Interactive Mode configured");
-}
-
-// ---- Linux ------------------------------------------------------------------
-
-/// Set _NET_WM_WINDOW_TYPE for a raw X11 window ID.
-/// Extracted as a public function so both Tauri webview and CEF windows can use it.
-#[cfg(target_os = "linux")]
-pub fn set_x11_window_type(window_id: u64, window_type: &str) -> Result<(), String> {
-    let id_hex = format!("0x{:x}", window_id);
-
-    let output = std::process::Command::new("xprop")
-        .args([
-            "-id",
-            &id_hex,
-            "-f",
-            "_NET_WM_WINDOW_TYPE",
-            "32a",
-            "-set",
-            "_NET_WM_WINDOW_TYPE",
-            window_type,
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run xprop: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("xprop failed: {}", stderr));
-    }
-
-    info!("Linux: Set {} on window 0x{:x}", window_type, window_id);
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
-    let _ = window.set_fullscreen(false);
-
-    let window_id = find_linux_window_id()?;
-    set_x11_window_type(window_id, "_NET_WM_WINDOW_TYPE_DESKTOP")?;
-
-    info!("Linux: Desktop Mode applied (_NET_WM_WINDOW_TYPE_DESKTOP)");
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn apply_interactive_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
-    let window_id = find_linux_window_id()?;
-    set_x11_window_type(window_id, "_NET_WM_WINDOW_TYPE_NORMAL")?;
-
-    let _ = window.set_fullscreen(true);
-
-    info!("Linux: Interactive Mode applied (_NET_WM_WINDOW_TYPE_NORMAL)");
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn find_linux_window_id() -> Result<u64, String> {
-    let pid = std::process::id();
-
-    let output = std::process::Command::new("xdotool")
-        .args(["search", "--pid", &pid.to_string()])
-        .output()
-        .map_err(|e| format!("Failed to run xdotool: {}", e))?;
-
-    if !output.status.success() {
-        return Err("xdotool search failed".to_string());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Take the first window ID
-    stdout
-        .lines()
-        .next()
-        .and_then(|line| line.trim().parse::<u64>().ok())
-        .ok_or_else(|| "No window ID found via xdotool".to_string())
 }
 
 // ============================================================================
