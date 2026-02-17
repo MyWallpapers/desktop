@@ -184,9 +184,58 @@ fn apply_layer_mode(window: &tauri::WebviewWindow, mode: WindowLayerMode) -> Res
 
 // ---- Windows ----------------------------------------------------------------
 
+/// Search for the WorkerW window behind SHELLDLL_DefView.
+/// Returns HWND::default() (invalid) if not found.
+#[cfg(target_os = "windows")]
+unsafe fn find_desktop_worker_w() -> (windows::Win32::Foundation::HWND, u32, bool) {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    struct EnumData {
+        worker_w: HWND,
+        count: u32,
+        found_shelldll: bool,
+    }
+    let mut data = EnumData {
+        worker_w: HWND::default(),
+        count: 0,
+        found_shelldll: false,
+    };
+
+    unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let data = &mut *(lparam.0 as *mut EnumData);
+        data.count += 1;
+        if let Ok(def_view) = FindWindowExW(
+            hwnd,
+            HWND::default(),
+            windows::core::w!("SHELLDLL_DefView"),
+            None,
+        ) {
+            if !def_view.is_invalid() {
+                data.found_shelldll = true;
+                if let Ok(worker) =
+                    FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None)
+                {
+                    if !worker.is_invalid() {
+                        data.worker_w = worker;
+                    }
+                }
+            }
+        }
+        BOOL(1)
+    }
+
+    let _ = EnumWindows(
+        Some(enum_callback),
+        LPARAM(&mut data as *mut EnumData as isize),
+    );
+
+    (data.worker_w, data.count, data.found_shelldll)
+}
+
 #[cfg(target_os = "windows")]
 fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     let our_hwnd = window
@@ -198,85 +247,92 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
     let _ = window.set_fullscreen(false);
 
     unsafe {
-        // 1. Find Progman
-        let progman = FindWindowW(windows::core::w!("Progman"), None)
-            .map_err(|_| "Could not find Progman window".to_string())?;
-        if progman.is_invalid() {
-            let _ = window.set_fullscreen(true);
-            return Err("Could not find Progman window".to_string());
-        }
-        info!("Found Progman: {:?}", progman);
-
-        // 2. Send magic message to spawn WorkerW
-        let mut _result: usize = 0;
-        let _ = SendMessageTimeoutW(
-            progman,
-            0x052C,
-            WPARAM(0x0000_000D),
-            LPARAM(0),
-            SMTO_NORMAL,
-            1000,
-            Some(&mut _result),
-        );
-        let _ = SendMessageTimeoutW(
-            progman,
-            0x052C,
-            WPARAM(0x0000_000D),
-            LPARAM(1),
-            SMTO_NORMAL,
-            1000,
-            Some(&mut _result),
+        // 1. Check if WorkerW already exists (e.g. from a previous toggle)
+        let (mut worker_w, count, found_shelldll) = find_desktop_worker_w();
+        info!(
+            "Pre-check: enumerated {} windows, SHELLDLL_DefView found: {}, WorkerW: {:?}",
+            count, found_shelldll, worker_w
         );
 
-        // Give Windows time to spawn WorkerW
-        std::thread::sleep(std::time::Duration::from_millis(150));
-
-        // 3. Find the WorkerW behind SHELLDLL_DefView
-        struct EnumData {
-            worker_w: HWND,
-        }
-        let mut data = EnumData {
-            worker_w: HWND::default(),
-        };
-
-        unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-            let data = &mut *(lparam.0 as *mut EnumData);
-            if let Ok(def_view) = FindWindowExW(
-                hwnd,
-                HWND::default(),
-                windows::core::w!("SHELLDLL_DefView"),
-                None,
-            ) {
-                if !def_view.is_invalid() {
-                    if let Ok(worker) =
-                        FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None)
-                    {
-                        data.worker_w = worker;
-                    }
-                }
+        if worker_w.is_invalid() {
+            // 2. Find Progman and send magic message to spawn WorkerW
+            let progman = FindWindowW(windows::core::w!("Progman"), None)
+                .map_err(|_| "Could not find Progman window".to_string())?;
+            if progman.is_invalid() {
+                let _ = window.set_fullscreen(true);
+                return Err("Could not find Progman window".to_string());
             }
-            BOOL(1) // continue enumeration
+            info!("Found Progman: {:?}", progman);
+
+            // Method 1: wParam=0xD (standard for Win10+)
+            let mut result: usize = 0;
+            let _ = SendMessageTimeoutW(
+                progman,
+                0x052C,
+                WPARAM(0x0000_000D),
+                LPARAM(0),
+                SMTO_NORMAL,
+                1000,
+                Some(&mut result),
+            );
+            let _ = SendMessageTimeoutW(
+                progman,
+                0x052C,
+                WPARAM(0x0000_000D),
+                LPARAM(1),
+                SMTO_NORMAL,
+                1000,
+                Some(&mut result),
+            );
+
+            std::thread::sleep(std::time::Duration::from_millis(300));
+
+            let (w, count, found) = find_desktop_worker_w();
+            worker_w = w;
+            info!(
+                "After method 1: enumerated {} windows, SHELLDLL_DefView: {}, WorkerW: {:?}",
+                count, found, worker_w
+            );
+
+            // Method 2: wParam=0 (fallback for Win11 / alternate shells)
+            if worker_w.is_invalid() {
+                info!("Method 1 failed, trying method 2 (wParam=0)...");
+                let _ = SendMessageTimeoutW(
+                    progman,
+                    0x052C,
+                    WPARAM(0),
+                    LPARAM(0),
+                    SMTO_NORMAL,
+                    1000,
+                    Some(&mut result),
+                );
+
+                std::thread::sleep(std::time::Duration::from_millis(300));
+
+                let (w, count, found) = find_desktop_worker_w();
+                worker_w = w;
+                info!(
+                    "After method 2: enumerated {} windows, SHELLDLL_DefView: {}, WorkerW: {:?}",
+                    count, found, worker_w
+                );
+            }
         }
 
-        let _ = EnumWindows(
-            Some(enum_callback),
-            LPARAM(&mut data as *mut EnumData as isize),
-        );
-
-        if data.worker_w.is_invalid() {
-            // Restore fullscreen since desktop mode failed
+        if worker_w.is_invalid() {
             let _ = window.set_fullscreen(true);
-            return Err("Could not find WorkerW — Desktop Mode not available on this system".to_string());
+            return Err(
+                "Could not find WorkerW — Desktop Mode not available on this system".to_string(),
+            );
         }
 
-        info!("Found WorkerW: {:?}", data.worker_w);
+        info!("Found WorkerW: {:?}", worker_w);
 
-        // 4. Reparent our window into WorkerW
-        let _ = SetParent(our_hwnd, data.worker_w);
+        // 3. Reparent our window into WorkerW
+        let _ = SetParent(our_hwnd, worker_w);
 
-        // 5. Resize to cover WorkerW
+        // 4. Resize to cover WorkerW
         let mut rect = windows::Win32::Foundation::RECT::default();
-        let _ = GetClientRect(data.worker_w, &mut rect);
+        let _ = GetClientRect(worker_w, &mut rect);
         let _ = SetWindowPos(
             our_hwnd,
             HWND::default(),
@@ -287,7 +343,7 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
 
-        // 6. Remove WS_EX_TOOLWINDOW since we're behind icons now
+        // 5. Remove WS_EX_TOOLWINDOW since we're behind icons now
         let style = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(
             our_hwnd,
