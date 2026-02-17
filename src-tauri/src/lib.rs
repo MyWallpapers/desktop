@@ -8,8 +8,7 @@ mod commands_core;
 mod tray;
 mod window_layer;
 
-use tracing::{info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{info, warn};
 
 /// Build the __MW_INIT__ injection script (runs before page JS).
 fn mw_init_script() -> String {
@@ -32,28 +31,8 @@ fn mw_init_script() -> String {
 
 pub use commands::*;
 
-/// Initialize logging based on debug/release mode
-fn init_logging() {
-    let level = if cfg!(debug_assertions) {
-        Level::DEBUG
-    } else {
-        Level::INFO
-    };
-
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(level)
-        .with_target(true)
-        .with_thread_ids(false)
-        .with_file(cfg!(debug_assertions))
-        .with_line_number(cfg!(debug_assertions))
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
-}
-
 /// Main entry point
 pub fn main() {
-    init_logging();
     info!(
         "Starting MyWallpaper Desktop v{}",
         env!("CARGO_PKG_VERSION")
@@ -71,6 +50,24 @@ fn start_with_tauri_webview() {
     use tauri::{Emitter, Listener, Manager};
 
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(if cfg!(debug_assertions) {
+                    log::LevelFilter::Debug
+                } else {
+                    log::LevelFilter::Info
+                })
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Webview,
+                ))
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir { file_name: None },
+                ))
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ))
+                .build(),
+        )
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
