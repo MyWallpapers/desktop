@@ -189,11 +189,10 @@ pub fn apply_layer_mode_pub(window: &tauri::WebviewWindow, mode: WindowLayerMode
 
 // ---- Windows ----------------------------------------------------------------
 //
-// Canonical WorkerW embedding used by Lively Wallpaper, weebp, etc:
-//   1. Find Progman
-//   2. Send 0x052C to spawn WorkerW
-//   3. EnumWindows → find window with SHELLDLL_DefView → get next sibling WorkerW
-//   4. Strip decorations, add WS_CHILD, SetParent into that WorkerW
+// Canonical WorkerW embedding (Lively Wallpaper, weebp):
+//   1. Find Progman, send 0x052C to spawn WorkerW
+//   2. EnumWindows → find window with SHELLDLL_DefView → get next sibling WorkerW
+//   3. SetParent(our_hwnd, worker_w) + resize to fill
 
 /// Find the WorkerW behind desktop icons.
 ///
@@ -241,49 +240,33 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         .map_err(|e| format!("Failed to get HWND: {}", e))?;
     let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
 
-    // Exit fullscreen before reparenting (avoids Tauri state conflicts)
-    let _ = window.set_fullscreen(false);
-
     unsafe {
-        // 1. Find Progman
+        // 1. Find Progman and spawn WorkerW
         let progman = FindWindowW(windows::core::w!("Progman"), None)
             .map_err(|_| "Could not find Progman".to_string())?;
         info!("Found Progman: {:?}", progman);
 
-        // 2. Send 0x052C to spawn the WorkerW layer
         let mut result: usize = 0;
         let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut result));
         let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut result));
 
-        // 3. Find the target WorkerW (sibling after SHELLDLL_DefView's parent)
+        // 2. Find the target WorkerW (sibling after SHELLDLL_DefView's parent)
         let worker_w = find_worker_w().ok_or("Could not find WorkerW – Desktop Mode not available")?;
         info!("Found target WorkerW: {:?}", worker_w);
 
-        // 4. Strip decorations + add WS_CHILD
-        let style = GetWindowLongPtrW(our_hwnd, GWL_STYLE) as u32;
-        let new_style = (style & !(WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0
-            | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0)) | WS_CHILD.0;
-        SetWindowLongPtrW(our_hwnd, GWL_STYLE, new_style as isize);
-
-        let exstyle = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE) as u32;
-        let new_exstyle = exstyle & !(WS_EX_DLGMODALFRAME.0 | WS_EX_WINDOWEDGE.0
-            | WS_EX_CLIENTEDGE.0 | WS_EX_STATICEDGE.0
-            | WS_EX_TOOLWINDOW.0 | WS_EX_APPWINDOW.0);
-        SetWindowLongPtrW(our_hwnd, GWL_EXSTYLE, new_exstyle as isize);
-
-        // 5. Reparent into WorkerW
+        // 3. Reparent into WorkerW — that's it, no style changes
         let _ = SetParent(our_hwnd, worker_w);
 
-        // 6. Resize to fill WorkerW
+        // 4. Resize to fill WorkerW and show
         let mut rect = windows::Win32::Foundation::RECT::default();
         let _ = GetClientRect(worker_w, &mut rect);
+        info!("WorkerW rect: {}x{}", rect.right, rect.bottom);
+
         let _ = SetWindowPos(
             our_hwnd, HWND::default(),
             0, 0, rect.right, rect.bottom,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
-
-        let _ = ShowWindow(our_hwnd, SW_SHOW);
     }
 
     info!("Windows: Desktop Mode applied");
@@ -301,27 +284,15 @@ fn apply_interactive_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
     let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
 
     unsafe {
-        // 1. Detach from WorkerW → reparent to desktop
-        let _ = SetParent(our_hwnd, GetDesktopWindow());
+        // 1. Detach from WorkerW
+        let _ = SetParent(our_hwnd, HWND::default());
 
-        // 2. Remove WS_CHILD, restore normal window styles
-        let style = GetWindowLongPtrW(our_hwnd, GWL_STYLE) as u32;
-        let new_style = (style & !WS_CHILD.0) | WS_POPUP.0;
-        SetWindowLongPtrW(our_hwnd, GWL_STYLE, new_style as isize);
-
-        // 3. Set WS_EX_TOOLWINDOW (hide from taskbar)
-        let exstyle = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE) as u32;
-        let new_exstyle = (exstyle & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0;
-        SetWindowLongPtrW(our_hwnd, GWL_EXSTYLE, new_exstyle as isize);
-
-        // 4. Force frame redraw
-        let _ = SetWindowPos(
-            our_hwnd, HWND::default(), 0, 0, 0, 0,
-            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER,
-        );
+        // 2. Ensure WS_EX_TOOLWINDOW (hide from taskbar, same as startup)
+        let exstyle = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(our_hwnd, GWL_EXSTYLE, exstyle | WS_EX_TOOLWINDOW.0 as isize);
     }
 
-    // 5. Restore position to cover primary monitor
+    // 3. Restore position + fullscreen (same as initial setup in lib.rs)
     if let Some(monitor) = window.primary_monitor().ok().flatten() {
         let size = monitor.size();
         let pos = monitor.position();
@@ -329,7 +300,6 @@ fn apply_interactive_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(size.width, size.height)));
     }
 
-    // 6. Show + fullscreen
     let _ = window.show();
     let _ = window.set_focus();
     let _ = window.set_fullscreen(true);
