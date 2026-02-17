@@ -182,158 +182,58 @@ fn apply_layer_mode(window: &tauri::WebviewWindow, mode: WindowLayerMode) -> Res
     }
 }
 
-// ---- Windows ----------------------------------------------------------------
+/// Public version for use from tray.rs
+pub fn apply_layer_mode_pub(window: &tauri::WebviewWindow, mode: WindowLayerMode) -> Result<(), String> {
+    apply_layer_mode(window, mode)
+}
 
-/// Enumerate ALL top-level WorkerW windows.
-/// Returns a list of (HWND, has_shelldll_child) pairs.
+// ---- Windows ----------------------------------------------------------------
+//
+// Canonical WorkerW embedding used by Lively Wallpaper, weebp, etc:
+//   1. Find Progman
+//   2. Send 0x052C to spawn WorkerW
+//   3. EnumWindows → find window with SHELLDLL_DefView → get next sibling WorkerW
+//   4. Strip decorations, add WS_CHILD, SetParent into that WorkerW
+
+/// Find the WorkerW behind desktop icons.
+///
+/// Algorithm: enumerate all top-level windows, find the one containing
+/// SHELLDLL_DefView (the desktop icon container), then get its next
+/// sibling with class "WorkerW". That sibling is the render target.
 #[cfg(target_os = "windows")]
-unsafe fn enumerate_worker_ws() -> Vec<(windows::Win32::Foundation::HWND, bool)> {
+unsafe fn find_worker_w() -> Option<windows::Win32::Foundation::HWND> {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    struct EnumData {
-        workers: Vec<(HWND, bool)>,
-    }
+    let mut target: HWND = HWND::default();
 
-    let mut data = EnumData {
-        workers: Vec::new(),
-    };
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let target = &mut *(lparam.0 as *mut HWND);
 
-    unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let data = &mut *(lparam.0 as *mut EnumData);
-
-        let mut class_name = [0u16; 256];
-        let len = GetClassNameW(hwnd, &mut class_name);
-        if len > 0 {
-            let name = String::from_utf16_lossy(&class_name[..len as usize]);
-            if name == "WorkerW" {
-                let has_shelldll = FindWindowExW(
-                    hwnd,
-                    HWND::default(),
-                    windows::core::w!("SHELLDLL_DefView"),
-                    None,
-                )
-                .map_or(false, |h| !h.is_invalid());
-
-                data.workers.push((hwnd, has_shelldll));
+        // Does this window contain SHELLDLL_DefView?
+        let shell = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None);
+        if let Ok(shell) = shell {
+            if !shell.is_invalid() {
+                // The next sibling WorkerW after this window is our target
+                if let Ok(w) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
+                    if !w.is_invalid() {
+                        *target = w;
+                        return BOOL(0); // Stop
+                    }
+                }
             }
         }
-
-        BOOL(1)
+        BOOL(1) // Continue
     }
 
-    let _ = EnumWindows(
-        Some(enum_callback),
-        LPARAM(&mut data as *mut EnumData as isize),
-    );
+    let _ = EnumWindows(Some(callback), LPARAM(&mut target as *mut HWND as isize));
 
-    data.workers
-}
-
-/// Find the WorkerW window suitable for desktop wallpaper reparenting.
-/// This is the WorkerW that does NOT contain SHELLDLL_DefView.
-#[cfg(target_os = "windows")]
-unsafe fn find_target_worker_w() -> Option<windows::Win32::Foundation::HWND> {
-    let workers = enumerate_worker_ws();
-
-    info!("WorkerW scan: found {} WorkerW windows", workers.len());
-    for (i, (hwnd, has_shelldll)) in workers.iter().enumerate() {
-        info!(
-            "  WorkerW[{}]: {:?}, has_shelldll: {}",
-            i, hwnd, has_shelldll
-        );
-    }
-
-    // Target = WorkerW without SHELLDLL_DefView
-    workers
-        .iter()
-        .find(|(_, has_shelldll)| !has_shelldll)
-        .map(|(hwnd, _)| *hwnd)
-}
-
-/// Send the magic 0x052C message to Progman to spawn WorkerW.
-#[cfg(target_os = "windows")]
-unsafe fn send_spawn_messages(progman: windows::Win32::Foundation::HWND) {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::*;
-
-    let mut result: usize = 0;
-
-    // Method 1: wParam=0xD (standard Win10+)
-    let _ = SendMessageTimeoutW(
-        progman,
-        0x052C,
-        WPARAM(0x0000_000D),
-        LPARAM(0),
-        SMTO_NORMAL,
-        1000,
-        Some(&mut result),
-    );
-    let _ = SendMessageTimeoutW(
-        progman,
-        0x052C,
-        WPARAM(0x0000_000D),
-        LPARAM(1),
-        SMTO_NORMAL,
-        1000,
-        Some(&mut result),
-    );
-
-    // Method 2: wParam=0 (Win11 / alternate shells)
-    let _ = SendMessageTimeoutW(
-        progman,
-        0x052C,
-        WPARAM(0),
-        LPARAM(0),
-        SMTO_NORMAL,
-        1000,
-        Some(&mut result),
-    );
-}
-
-/// Reparent our window into the given container (WorkerW or Progman).
-#[cfg(target_os = "windows")]
-unsafe fn reparent_into(
-    our_hwnd: windows::Win32::Foundation::HWND,
-    container: windows::Win32::Foundation::HWND,
-    container_name: &str,
-) -> Result<(), String> {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::*;
-
-    let _ = SetParent(our_hwnd, container);
-
-    // Resize to cover the container
-    let mut rect = windows::Win32::Foundation::RECT::default();
-    let _ = GetClientRect(container, &mut rect);
-    let _ = SetWindowPos(
-        our_hwnd,
-        HWND::default(),
-        0,
-        0,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-    );
-
-    // Remove WS_EX_TOOLWINDOW since we're behind icons now
-    let style = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE);
-    SetWindowLongPtrW(
-        our_hwnd,
-        GWL_EXSTYLE,
-        style & !(WS_EX_TOOLWINDOW.0 as isize),
-    );
-
-    info!(
-        "Windows: Desktop Mode applied (reparented into {})",
-        container_name
-    );
-    Ok(())
+    if target.is_invalid() { None } else { Some(target) }
 }
 
 #[cfg(target_os = "windows")]
 fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     let our_hwnd = window
@@ -341,49 +241,53 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         .map_err(|e| format!("Failed to get HWND: {}", e))?;
     let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
 
-    // Remove fullscreen BEFORE reparenting to avoid Tauri state conflicts
+    // Exit fullscreen before reparenting (avoids Tauri state conflicts)
     let _ = window.set_fullscreen(false);
 
     unsafe {
-        // Phase 1: Check if a suitable WorkerW already exists
-        if let Some(worker_w) = find_target_worker_w() {
-            info!("Found existing target WorkerW: {:?}", worker_w);
-            return reparent_into(our_hwnd, worker_w, "WorkerW");
-        }
-
-        // Phase 2: Spawn WorkerW via Progman magic messages, with retries
+        // 1. Find Progman
         let progman = FindWindowW(windows::core::w!("Progman"), None)
-            .map_err(|_| "Could not find Progman window".to_string())?;
-        if progman.is_invalid() {
-            let _ = window.set_fullscreen(true);
-            return Err("Could not find Progman window".to_string());
-        }
+            .map_err(|_| "Could not find Progman".to_string())?;
         info!("Found Progman: {:?}", progman);
 
-        for attempt in 1..=5 {
-            send_spawn_messages(progman);
+        // 2. Send 0x052C to spawn the WorkerW layer
+        let mut result: usize = 0;
+        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut result));
+        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut result));
 
-            let delay = 200 * attempt;
-            info!(
-                "WorkerW spawn attempt {}/5, waiting {}ms...",
-                attempt, delay
-            );
-            std::thread::sleep(std::time::Duration::from_millis(delay));
+        // 3. Find the target WorkerW (sibling after SHELLDLL_DefView's parent)
+        let worker_w = find_worker_w().ok_or("Could not find WorkerW – Desktop Mode not available")?;
+        info!("Found target WorkerW: {:?}", worker_w);
 
-            if let Some(worker_w) = find_target_worker_w() {
-                info!(
-                    "WorkerW found on attempt {}: {:?}",
-                    attempt, worker_w
-                );
-                return reparent_into(our_hwnd, worker_w, "WorkerW");
-            }
-        }
+        // 4. Strip decorations + add WS_CHILD
+        let style = GetWindowLongPtrW(our_hwnd, GWL_STYLE) as u32;
+        let new_style = (style & !(WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0
+            | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0)) | WS_CHILD.0;
+        SetWindowLongPtrW(our_hwnd, GWL_STYLE, new_style as isize);
 
-        // Phase 3: Progman fallback — reparent directly into Progman.
-        // This places our window inside Progman, behind SHELLDLL_DefView (desktop icons).
-        warn!("WorkerW spawn failed after 5 attempts, using Progman fallback");
-        reparent_into(our_hwnd, progman, "Progman (fallback)")
+        let exstyle = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE) as u32;
+        let new_exstyle = exstyle & !(WS_EX_DLGMODALFRAME.0 | WS_EX_WINDOWEDGE.0
+            | WS_EX_CLIENTEDGE.0 | WS_EX_STATICEDGE.0
+            | WS_EX_TOOLWINDOW.0 | WS_EX_APPWINDOW.0);
+        SetWindowLongPtrW(our_hwnd, GWL_EXSTYLE, new_exstyle as isize);
+
+        // 5. Reparent into WorkerW
+        let _ = SetParent(our_hwnd, worker_w);
+
+        // 6. Resize to fill WorkerW
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        let _ = GetClientRect(worker_w, &mut rect);
+        let _ = SetWindowPos(
+            our_hwnd, HWND::default(),
+            0, 0, rect.right, rect.bottom,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+
+        let _ = ShowWindow(our_hwnd, SW_SHOW);
     }
+
+    info!("Windows: Desktop Mode applied");
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -397,37 +301,40 @@ fn apply_interactive_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
     let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
 
     unsafe {
-        // 1. Detach from WorkerW/Progman (reparent to desktop/null)
-        let _ = SetParent(our_hwnd, HWND::default());
+        // 1. Detach from WorkerW → reparent to desktop
+        let _ = SetParent(our_hwnd, GetDesktopWindow());
 
-        // 2. Set WS_EX_TOOLWINDOW to hide from taskbar
-        let style = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(our_hwnd, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW.0 as isize);
+        // 2. Remove WS_CHILD, restore normal window styles
+        let style = GetWindowLongPtrW(our_hwnd, GWL_STYLE) as u32;
+        let new_style = (style & !WS_CHILD.0) | WS_POPUP.0;
+        SetWindowLongPtrW(our_hwnd, GWL_STYLE, new_style as isize);
+
+        // 3. Set WS_EX_TOOLWINDOW (hide from taskbar)
+        let exstyle = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE) as u32;
+        let new_exstyle = (exstyle & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0;
+        SetWindowLongPtrW(our_hwnd, GWL_EXSTYLE, new_exstyle as isize);
+
+        // 4. Force frame redraw
+        let _ = SetWindowPos(
+            our_hwnd, HWND::default(), 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+        );
     }
 
-    // 3. Restore window position to cover primary monitor (same as startup in lib.rs)
+    // 5. Restore position to cover primary monitor
     if let Some(monitor) = window.primary_monitor().ok().flatten() {
         let size = monitor.size();
-        let position = monitor.position();
-        info!(
-            "Restoring to primary monitor: {}x{} at ({}, {})",
-            size.width, size.height, position.x, position.y
-        );
-        let _ = window.set_position(tauri::Position::Physical(
-            tauri::PhysicalPosition::new(position.x, position.y),
-        ));
-        let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(
-            size.width,
-            size.height,
-        )));
+        let pos = monitor.position();
+        let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(pos.x, pos.y)));
+        let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(size.width, size.height)));
     }
 
-    // 4. Show, focus, then fullscreen
+    // 6. Show + fullscreen
     let _ = window.show();
     let _ = window.set_focus();
     let _ = window.set_fullscreen(true);
 
-    info!("Windows: Interactive Mode applied (detached from WorkerW)");
+    info!("Windows: Interactive Mode applied");
     Ok(())
 }
 
