@@ -194,6 +194,59 @@ pub fn apply_layer_mode_pub(window: &tauri::WebviewWindow, mode: WindowLayerMode
 //   2. EnumWindows → find window with SHELLDLL_DefView → get next sibling WorkerW
 //   3. SetParent(our_hwnd, worker_w) + resize to fill
 
+/// Diagnostic: enumerate all top-level windows and log their classes.
+/// This helps debug why WorkerW might not be found.
+#[cfg(target_os = "windows")]
+unsafe fn log_desktop_hierarchy() {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    // Check Progman's direct children
+    let progman = FindWindowW(windows::core::w!("Progman"), None);
+    if let Ok(progman) = progman {
+        // Does Progman directly contain SHELLDLL_DefView?
+        let shell_in_progman = FindWindowExW(
+            progman, HWND::default(),
+            windows::core::w!("SHELLDLL_DefView"), None,
+        );
+        match shell_in_progman {
+            Ok(h) if !h.is_invalid() => info!("[Diag] SHELLDLL_DefView is DIRECT child of Progman"),
+            _ => info!("[Diag] SHELLDLL_DefView is NOT a direct child of Progman"),
+        }
+    }
+
+    // Count WorkerW windows among top-level windows
+    struct Counter { count: i32 }
+    let mut counter = Counter { count: 0 };
+
+    unsafe extern "system" fn count_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let counter = &mut *(lparam.0 as *mut Counter);
+        let mut class_name = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut class_name);
+        if len > 0 {
+            let name = String::from_utf16_lossy(&class_name[..len as usize]);
+            if name == "WorkerW" {
+                counter.count += 1;
+
+                // Check if this WorkerW has SHELLDLL_DefView
+                let shell = FindWindowExW(
+                    hwnd, HWND::default(),
+                    windows::core::w!("SHELLDLL_DefView"), None,
+                );
+                let has_shell = shell.map_or(false, |h| !h.is_invalid());
+                tracing::info!(
+                    "[Diag] Top-level WorkerW #{}: {:?}, has_SHELLDLL_DefView: {}",
+                    counter.count, hwnd, has_shell
+                );
+            }
+        }
+        BOOL(1)
+    }
+
+    let _ = EnumWindows(Some(count_cb), LPARAM(&mut counter as *mut Counter as isize));
+    info!("[Diag] Total top-level WorkerW windows: {}", counter.count);
+}
+
 /// Find the WorkerW behind desktop icons.
 ///
 /// Algorithm: enumerate all top-level windows, find the one containing
@@ -204,30 +257,64 @@ unsafe fn find_worker_w() -> Option<windows::Win32::Foundation::HWND> {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    let mut target: HWND = HWND::default();
+    struct SearchResult {
+        target: HWND,
+        shell_parent: HWND,
+    }
+
+    let mut result = SearchResult {
+        target: HWND::default(),
+        shell_parent: HWND::default(),
+    };
 
     unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let target = &mut *(lparam.0 as *mut HWND);
+        let result = &mut *(lparam.0 as *mut SearchResult);
 
         // Does this window contain SHELLDLL_DefView?
         let shell = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None);
         if let Ok(shell) = shell {
             if !shell.is_invalid() {
+                result.shell_parent = hwnd;
+
                 // The next sibling WorkerW after this window is our target
                 if let Ok(w) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
                     if !w.is_invalid() {
-                        *target = w;
-                        return BOOL(0); // Stop
+                        result.target = w;
+                        return BOOL(0); // Stop — found it
                     }
                 }
+                // SHELLDLL_DefView found but no sibling WorkerW — keep looking
+                // (but we recorded shell_parent for diagnostics)
             }
         }
         BOOL(1) // Continue
     }
 
-    let _ = EnumWindows(Some(callback), LPARAM(&mut target as *mut HWND as isize));
+    let _ = EnumWindows(Some(callback), LPARAM(&mut result as *mut SearchResult as isize));
 
-    if target.is_invalid() { None } else { Some(target) }
+    if !result.shell_parent.is_invalid() {
+        let mut class_name = [0u16; 256];
+        let len = GetClassNameW(result.shell_parent, &mut class_name);
+        let parent_class = if len > 0 {
+            String::from_utf16_lossy(&class_name[..len as usize])
+        } else {
+            "unknown".to_string()
+        };
+        info!(
+            "[FindWorkerW] SHELLDLL_DefView parent: {:?} (class: {})",
+            result.shell_parent, parent_class
+        );
+    } else {
+        warn!("[FindWorkerW] SHELLDLL_DefView not found in any top-level window!");
+    }
+
+    if result.target.is_invalid() {
+        info!("[FindWorkerW] No sibling WorkerW found after SHELLDLL_DefView parent");
+        None
+    } else {
+        info!("[FindWorkerW] Target WorkerW: {:?}", result.target);
+        Some(result.target)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -241,26 +328,50 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
     let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
 
     unsafe {
-        // 1. Find Progman and spawn WorkerW
+        // Log the current desktop hierarchy before we start
+        info!("=== Desktop Mode: starting ===");
+        log_desktop_hierarchy();
+
+        // 1. Find Progman
         let progman = FindWindowW(windows::core::w!("Progman"), None)
             .map_err(|_| "Could not find Progman".to_string())?;
         info!("Found Progman: {:?}", progman);
 
-        let mut result: usize = 0;
-        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut result));
-        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut result));
+        // 2. Send 0x052C to spawn WorkerW (two variants for compatibility)
+        let mut msg_result: usize = 0;
 
-        // 2. Find the target WorkerW (sibling after SHELLDLL_DefView's parent)
-        let worker_w = find_worker_w().ok_or("Could not find WorkerW – Desktop Mode not available")?;
-        info!("Found target WorkerW: {:?}", worker_w);
+        // Method A: wParam=0xD (Win10+)
+        let r1 = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
+        info!("[0x052C] (0xD, 0) → result: {}, lresult: {}", r1.0, msg_result);
 
-        // 3. Reparent into WorkerW — that's it, no style changes
+        let r2 = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
+        info!("[0x052C] (0xD, 1) → result: {}, lresult: {}", r2.0, msg_result);
+
+        // Method B: wParam=0 (Win11 / alternate)
+        let r3 = SendMessageTimeoutW(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
+        info!("[0x052C] (0, 0) → result: {}, lresult: {}", r3.0, msg_result);
+
+        // 3. Wait for Windows to process the message and create WorkerW
+        info!("Waiting 300ms for WorkerW creation...");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // 4. Log hierarchy again after message
+        log_desktop_hierarchy();
+
+        // 5. Find the target WorkerW
+        let worker_w = find_worker_w()
+            .ok_or_else(|| {
+                "Could not find WorkerW after 0x052C — check logs for diagnostic info".to_string()
+            })?;
+        info!("Target WorkerW: {:?}", worker_w);
+
+        // 6. Reparent into WorkerW
         let _ = SetParent(our_hwnd, worker_w);
 
-        // 4. Resize to fill WorkerW and show
+        // 7. Resize to fill WorkerW
         let mut rect = windows::Win32::Foundation::RECT::default();
         let _ = GetClientRect(worker_w, &mut rect);
-        info!("WorkerW rect: {}x{}", rect.right, rect.bottom);
+        info!("WorkerW client rect: {}x{}", rect.right, rect.bottom);
 
         let _ = SetWindowPos(
             our_hwnd, HWND::default(),
@@ -269,7 +380,7 @@ fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
         );
     }
 
-    info!("Windows: Desktop Mode applied");
+    info!("=== Desktop Mode: applied ===");
     Ok(())
 }
 
