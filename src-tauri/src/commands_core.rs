@@ -27,15 +27,6 @@ pub struct UpdateInfo {
     pub date: Option<String>,
 }
 
-/// Layer information for the tray menu
-#[typeshare]
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LayerInfo {
-    pub id: String,
-    pub name: String,
-    pub visible: bool,
-}
-
 // ============================================================================
 // System Information
 // ============================================================================

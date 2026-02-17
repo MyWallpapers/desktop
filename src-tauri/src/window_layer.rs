@@ -1,527 +1,397 @@
-//! Window Layer Mode — Desktop vs Interactive
+//! Window Layer System — Web Desktop
 //!
-//! Desktop Mode: window placed BEHIND desktop icons (immune to Win+D / Cmd+F3).
-//!   - Windows: reparent into WorkerW (behind SHELLDLL_DefView)
-//!   - macOS: set window level to kCGDesktopWindowLevel, ignore mouse events
-//!
-//! Interactive Mode: window behind all apps, above desktop icons, mouse-interactive.
-//!   - Windows: detach from WorkerW, HWND_BOTTOM + WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE
-//!   - macOS: window level between desktop and normal, accept mouse events
+//! Windows: Injected into WorkerW (immune to Win+D).
+//!          Mouse hook intercepts clicks on empty desktop space and forwards them to WebView.
+//!          Native icons (ROLE_SYSTEM_LISTITEM) are ignored and process clicks natively.
+//! macOS: kCGDesktopWindowLevel set behind desktop icons. Native icon hiding via Finder defaults.
 
-use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
-use tauri::{Emitter, Manager};
 use tracing::{info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// Flag de sécurité pour ne pas spammer le système à la fermeture
+static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
-// Types & State
+// Setup Dispatch
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WindowLayerMode {
-    Desktop,
-    Interactive,
-}
+pub fn setup_desktop_window(window: &tauri::WebviewWindow) {
+    #[cfg(target_os = "windows")]
+    if let Err(e) = ensure_in_worker_w(window) {
+        warn!("Failed to setup Windows desktop layer: {}", e);
+    }
 
-pub struct WindowLayerState {
-    pub mode: Mutex<WindowLayerMode>,
-}
-
-impl WindowLayerState {
-    pub fn new() -> Self {
-        Self {
-            mode: Mutex::new(WindowLayerMode::Interactive),
-        }
+    #[cfg(target_os = "macos")]
+    if let Err(e) = setup_macos_desktop(window) {
+        warn!("Failed to setup macOS desktop layer: {}", e);
     }
 }
 
 // ============================================================================
-// Tauri Commands
+// UI Mode: Hide/Show Desktop Icons (Windows & macOS)
 // ============================================================================
 
-/// Set the window layer mode
+/// Commande Tauri appelée depuis le Frontend (JS/TS) pour masquer les icônes
 #[tauri::command]
-pub fn set_window_layer(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, WindowLayerState>,
-    mode: WindowLayerMode,
-) -> Result<(), String> {
-    info!("Setting window layer mode to: {:?}", mode);
+pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
+        use windows::Win32::Foundation::HWND;
 
-    if let Some(window) = app.get_webview_window("main") {
-        apply_layer_mode(&window, mode)?;
-    }
-
-    let mut current = state.mode.lock().map_err(|e| e.to_string())?;
-    *current = mode;
-
-    Ok(())
-}
-
-/// Get the current window layer mode
-#[tauri::command]
-pub fn get_window_layer(
-    state: tauri::State<'_, WindowLayerState>,
-) -> Result<WindowLayerMode, String> {
-    let mode = state.mode.lock().map_err(|e| e.to_string())?;
-    Ok(*mode)
-}
-
-/// Toggle the window layer mode and return the new mode.
-/// Emits "layer-mode-changed" event to the frontend.
-#[tauri::command]
-pub fn toggle_window_layer(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, WindowLayerState>,
-) -> Result<WindowLayerMode, String> {
-    let new_mode = {
-        let current = state.mode.lock().map_err(|e| e.to_string())?;
-        match *current {
-            WindowLayerMode::Desktop => WindowLayerMode::Interactive,
-            WindowLayerMode::Interactive => WindowLayerMode::Desktop,
-        }
-    };
-
-    info!("Toggling window layer mode to: {:?}", new_mode);
-
-    if let Some(window) = app.get_webview_window("main") {
-        apply_layer_mode(&window, new_mode)?;
-    }
-
-    let mut current = state.mode.lock().map_err(|e| e.to_string())?;
-    *current = new_mode;
-
-    // Emit event to frontend
-    let _ = app.emit("layer-mode-changed", new_mode);
-
-    Ok(new_mode)
-}
-
-// ============================================================================
-// Global Shortcut Commands
-// ============================================================================
-
-/// Register a global shortcut that toggles the window layer mode
-#[tauri::command]
-pub fn register_layer_shortcut(app: tauri::AppHandle, shortcut: String) -> Result<(), String> {
-    use tauri_plugin_global_shortcut::GlobalShortcutExt;
-
-    info!("Registering layer toggle shortcut: {}", shortcut);
-
-    let parsed: tauri_plugin_global_shortcut::Shortcut = shortcut
-        .parse()
-        .map_err(|e| format!("Invalid shortcut '{}': {}", shortcut, e))?;
-
-    // Check if already registered
-    if app.global_shortcut().is_registered(parsed) {
-        info!("Shortcut {} already registered, skipping", shortcut);
-        return Ok(());
-    }
-
-    app.global_shortcut()
-        .on_shortcut(parsed, move |app, _shortcut, event| {
-            // Only trigger on key press (not release)
-            if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                let state = app.state::<WindowLayerState>();
-                let new_mode = {
-                    let current = state.mode.lock().unwrap();
-                    match *current {
-                        WindowLayerMode::Desktop => WindowLayerMode::Interactive,
-                        WindowLayerMode::Interactive => WindowLayerMode::Desktop,
-                    }
-                };
-
-                info!("Global shortcut triggered, toggling to: {:?}", new_mode);
-
-                if let Some(window) = app.get_webview_window("main") {
-                    if let Err(e) = apply_layer_mode(&window, new_mode) {
-                        warn!("Failed to apply layer mode: {}", e);
-                        return;
-                    }
-                }
-
-                let mut current = state.mode.lock().unwrap();
-                *current = new_mode;
-
-                let _ = app.emit("layer-mode-changed", new_mode);
+        let slv_hwnd = mouse_hook::get_syslistview_hwnd();
+        if slv_hwnd != 0 {
+            let slv = HWND(slv_hwnd as *mut core::ffi::c_void);
+            unsafe {
+                let _ = ShowWindow(slv, if visible { SW_SHOW } else { SW_HIDE });
             }
-        })
-        .map_err(|e| format!("Failed to register shortcut: {}", e))?;
-
-    info!("Layer toggle shortcut registered: {}", shortcut);
-    Ok(())
-}
-
-/// Unregister a previously registered layer shortcut
-#[tauri::command]
-pub fn unregister_layer_shortcut(app: tauri::AppHandle, shortcut: String) -> Result<(), String> {
-    use tauri_plugin_global_shortcut::GlobalShortcutExt;
-
-    info!("Unregistering layer shortcut: {}", shortcut);
-
-    let parsed: tauri_plugin_global_shortcut::Shortcut = shortcut
-        .parse()
-        .map_err(|e| format!("Invalid shortcut '{}': {}", shortcut, e))?;
-
-    app.global_shortcut()
-        .unregister(parsed)
-        .map_err(|e| format!("Failed to unregister shortcut: {}", e))?;
-
-    Ok(())
-}
-
-// ============================================================================
-// Platform-specific layer mode application
-// ============================================================================
-
-fn apply_layer_mode(window: &tauri::WebviewWindow, mode: WindowLayerMode) -> Result<(), String> {
-    match mode {
-        WindowLayerMode::Desktop => apply_desktop_mode(window),
-        WindowLayerMode::Interactive => apply_interactive_mode(window),
-    }
-}
-
-/// Public version for use from tray.rs
-pub fn apply_layer_mode_pub(window: &tauri::WebviewWindow, mode: WindowLayerMode) -> Result<(), String> {
-    apply_layer_mode(window, mode)
-}
-
-// ---- Windows ----------------------------------------------------------------
-//
-// Canonical WorkerW embedding (Lively Wallpaper, weebp):
-//   1. Find Progman, send 0x052C to spawn WorkerW
-//   2. EnumWindows → find window with SHELLDLL_DefView → get next sibling WorkerW
-//   3. SetParent(our_hwnd, worker_w) + resize to fill
-
-/// Diagnostic: enumerate all top-level windows and log their classes.
-/// This helps debug why WorkerW might not be found.
-#[cfg(target_os = "windows")]
-unsafe fn log_desktop_hierarchy() {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::*;
-
-    // Check Progman's direct children
-    let progman = FindWindowW(windows::core::w!("Progman"), None);
-    if let Ok(progman) = progman {
-        // Does Progman directly contain SHELLDLL_DefView?
-        let shell_in_progman = FindWindowExW(
-            progman, HWND::default(),
-            windows::core::w!("SHELLDLL_DefView"), None,
-        );
-        match shell_in_progman {
-            Ok(h) if !h.is_invalid() => info!("[Diag] SHELLDLL_DefView is DIRECT child of Progman"),
-            _ => info!("[Diag] SHELLDLL_DefView is NOT a direct child of Progman"),
-        }
-    }
-
-    // Count WorkerW windows among top-level windows
-    struct Counter { count: i32 }
-    let mut counter = Counter { count: 0 };
-
-    unsafe extern "system" fn count_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let counter = &mut *(lparam.0 as *mut Counter);
-        let mut class_name = [0u16; 256];
-        let len = GetClassNameW(hwnd, &mut class_name);
-        if len > 0 {
-            let name = String::from_utf16_lossy(&class_name[..len as usize]);
-            if name == "WorkerW" {
-                counter.count += 1;
-
-                // Check if this WorkerW has SHELLDLL_DefView
-                let shell = FindWindowExW(
-                    hwnd, HWND::default(),
-                    windows::core::w!("SHELLDLL_DefView"), None,
-                );
-                let has_shell = shell.map_or(false, |h| !h.is_invalid());
-                tracing::info!(
-                    "[Diag] Top-level WorkerW #{}: {:?}, has_SHELLDLL_DefView: {}",
-                    counter.count, hwnd, has_shell
-                );
-            }
-        }
-        BOOL(1)
-    }
-
-    let _ = EnumWindows(Some(count_cb), LPARAM(&mut counter as *mut Counter as isize));
-    info!("[Diag] Total top-level WorkerW windows: {}", counter.count);
-}
-
-/// Find the WorkerW behind desktop icons.
-///
-/// Algorithm: enumerate all top-level windows, find the one containing
-/// SHELLDLL_DefView (the desktop icon container), then get its next
-/// sibling with class "WorkerW". That sibling is the render target.
-#[cfg(target_os = "windows")]
-unsafe fn find_worker_w() -> Option<windows::Win32::Foundation::HWND> {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::*;
-
-    struct SearchResult {
-        target: HWND,
-        shell_parent: HWND,
-    }
-
-    let mut result = SearchResult {
-        target: HWND::default(),
-        shell_parent: HWND::default(),
-    };
-
-    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let result = &mut *(lparam.0 as *mut SearchResult);
-
-        // Does this window contain SHELLDLL_DefView?
-        let shell = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None);
-        if let Ok(shell) = shell {
-            if !shell.is_invalid() {
-                result.shell_parent = hwnd;
-
-                // The next sibling WorkerW after this window is our target
-                if let Ok(w) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
-                    if !w.is_invalid() {
-                        result.target = w;
-                        return BOOL(0); // Stop — found it
-                    }
-                }
-                // SHELLDLL_DefView found but no sibling WorkerW — keep looking
-                // (but we recorded shell_parent for diagnostics)
-            }
-        }
-        BOOL(1) // Continue
-    }
-
-    let _ = EnumWindows(Some(callback), LPARAM(&mut result as *mut SearchResult as isize));
-
-    if !result.shell_parent.is_invalid() {
-        let mut class_name = [0u16; 256];
-        let len = GetClassNameW(result.shell_parent, &mut class_name);
-        let parent_class = if len > 0 {
-            String::from_utf16_lossy(&class_name[..len as usize])
+            info!("Windows: Desktop icons visibility set to {}", visible);
         } else {
-            "unknown".to_string()
-        };
-        info!(
-            "[FindWorkerW] SHELLDLL_DefView parent: {:?} (class: {})",
-            result.shell_parent, parent_class
-        );
-    } else {
-        warn!("[FindWorkerW] SHELLDLL_DefView not found in any top-level window!");
+            warn!("Cannot toggle icons: SysListView32 not found yet.");
+        }
     }
 
-    if result.target.is_invalid() {
-        info!("[FindWorkerW] No sibling WorkerW found after SHELLDLL_DefView parent");
-        None
-    } else {
-        info!("[FindWorkerW] Target WorkerW: {:?}", result.target);
-        Some(result.target)
+    #[cfg(target_os = "macos")]
+    {
+        // Sur macOS, on désactive l'affichage du bureau via le Finder
+        let val = if visible { "true" } else { "false" };
+        let _ = std::process::Command::new("defaults")
+            .args(["write", "com.apple.finder", "CreateDesktop", val])
+            .output();
+        let _ = std::process::Command::new("killall")
+            .arg("Finder")
+            .output();
+        info!("macOS: Desktop icons visibility set to {}", visible);
+    }
+
+    Ok(())
+}
+
+/// Sécurité : Appelé automatiquement à la fermeture de l'app pour rendre le bureau
+pub fn restore_desktop_icons() {
+    // Si on l'a déjà fait, on annule pour éviter le double "killall Finder"
+    if ICONS_RESTORED.swap(true, Ordering::SeqCst) {
+        return; 
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
+        use windows::Win32::Foundation::HWND;
+
+        let slv_hwnd = mouse_hook::get_syslistview_hwnd();
+        if slv_hwnd != 0 {
+            let slv = HWND(slv_hwnd as *mut core::ffi::c_void);
+            unsafe {
+                let _ = ShowWindow(slv, SW_SHOW);
+            }
+            info!("Windows: Desktop icons restored on exit.");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Sur macOS, on s'assure que le Finder réaffiche les icônes
+        let _ = std::process::Command::new("defaults")
+            .args(["write", "com.apple.finder", "CreateDesktop", "true"])
+            .output();
+        let _ = std::process::Command::new("killall")
+            .arg("Finder")
+            .output();
+        info!("macOS: Desktop icons restored on exit.");
     }
 }
 
+// ============================================================================
+// Windows: WorkerW Injection & Mouse Hook
+// ============================================================================
+
 #[cfg(target_os = "windows")]
-fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    let our_hwnd = window
-        .hwnd()
-        .map_err(|e| format!("Failed to get HWND: {}", e))?;
+    let our_hwnd = window.hwnd().map_err(|e| format!("Failed to get HWND: {}", e))?;
     let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
 
     unsafe {
-        // Log the current desktop hierarchy before we start
-        info!("=== Desktop Mode: starting ===");
-        log_desktop_hierarchy();
-
-        // 1. Find Progman
         let progman = FindWindowW(windows::core::w!("Progman"), None)
             .map_err(|_| "Could not find Progman".to_string())?;
-        info!("Found Progman: {:?}", progman);
 
-        // 2. Send 0x052C to spawn WorkerW (two variants for compatibility)
         let mut msg_result: usize = 0;
+        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
+        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
 
-        // Method A: wParam=0xD (Win10+)
-        let r1 = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
-        info!("[0x052C] (0xD, 0) → result: {}, lresult: {}", r1.0, msg_result);
+        std::thread::sleep(std::time::Duration::from_millis(150));
 
-        let r2 = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
-        info!("[0x052C] (0xD, 1) → result: {}, lresult: {}", r2.0, msg_result);
+        struct Found {
+            worker_w: HWND,
+            sys_list_view: HWND,
+        }
+        let mut found = Found { worker_w: HWND::default(), sys_list_view: HWND::default() };
 
-        // Method B: wParam=0 (Win11 / alternate)
-        let r3 = SendMessageTimeoutW(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
-        info!("[0x052C] (0, 0) → result: {}, lresult: {}", r3.0, msg_result);
+        unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let found = &mut *(lparam.0 as *mut Found);
+            if let Ok(shell) = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None) {
+                if !shell.is_invalid() {
+                    if let Ok(slv) = FindWindowExW(shell, HWND::default(), windows::core::w!("SysListView32"), None) {
+                        if !slv.is_invalid() { found.sys_list_view = slv; }
+                    }
+                    if let Ok(w) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
+                        if !w.is_invalid() {
+                            found.worker_w = w;
+                            return BOOL(0);
+                        }
+                    }
+                }
+            }
+            BOOL(1)
+        }
 
-        // 3. Wait for Windows to process the message and create WorkerW
-        info!("Waiting 300ms for WorkerW creation...");
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = EnumWindows(Some(callback), LPARAM(&mut found as *mut Found as isize));
 
-        // 4. Log hierarchy again after message
-        log_desktop_hierarchy();
+        if found.worker_w.is_invalid() {
+            return Err("Could not find WorkerW".to_string());
+        }
 
-        // 5. Find the target WorkerW
-        let worker_w = find_worker_w()
-            .ok_or_else(|| {
-                "Could not find WorkerW after 0x052C — check logs for diagnostic info".to_string()
-            })?;
-        info!("Target WorkerW: {:?}", worker_w);
+        mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
+        if !found.sys_list_view.is_invalid() {
+            mouse_hook::set_syslistview_hwnd(found.sys_list_view.0 as isize);
+        }
 
-        // 6. Reparent into WorkerW
-        let _ = SetParent(our_hwnd, worker_w);
-
-        // 7. Resize to fill WorkerW
-        let mut rect = windows::Win32::Foundation::RECT::default();
-        let _ = GetClientRect(worker_w, &mut rect);
-        info!("WorkerW client rect: {}x{}", rect.right, rect.bottom);
-
-        let _ = SetWindowPos(
-            our_hwnd, HWND::default(),
-            0, 0, rect.right, rect.bottom,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
+        let current_parent = GetParent(our_hwnd);
+        if current_parent != found.worker_w {
+            let _ = SetParent(our_hwnd, found.worker_w);
+            let mut rect = windows::Win32::Foundation::RECT::default();
+            let _ = GetClientRect(found.worker_w, &mut rect);
+            let _ = SetWindowPos(our_hwnd, HWND::default(), 0, 0, rect.right, rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            info!("Injected into WorkerW ({}x{})", rect.right, rect.bottom);
+        }
     }
 
-    info!("=== Desktop Mode: applied ===");
+    mouse_hook::start_hook_thread();
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn apply_interactive_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use windows::Win32::Foundation::HWND;
+pub mod mouse_hook {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    let our_hwnd = window
-        .hwnd()
-        .map_err(|e| format!("Failed to get HWND: {}", e))?;
-    let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
+    static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
+    static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
 
-    unsafe {
-        // 1. Detach from WorkerW
-        let _ = SetParent(our_hwnd, HWND::default());
+    pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
+    pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
+    pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
+    pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
 
-        // 2. WS_EX_TOOLWINDOW (hide from taskbar) + WS_EX_NOACTIVATE (don't steal focus)
-        let exstyle = GetWindowLongPtrW(our_hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(
-            our_hwnd,
-            GWL_EXSTYLE,
-            exstyle | WS_EX_TOOLWINDOW.0 as isize | WS_EX_NOACTIVATE.0 as isize,
-        );
+    unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
+        use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
+        use windows::Win32::System::Variant::VARIANT;
 
-        // 3. HWND_BOTTOM: behind all normal apps, above desktop icons
-        //    NO set_fullscreen — that forces the window to the FRONT
-        let _ = SetWindowPos(
-            our_hwnd, HWND_BOTTOM,
-            0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
+        let pt = windows::Win32::Foundation::POINT { x, y };
+        let mut p_acc: Option<IAccessible> = None;
+        let mut var_child = VARIANT::default();
+
+        if AccessibleObjectFromPoint(pt, &mut p_acc, &mut var_child).is_ok() {
+            if let Some(acc) = p_acc {
+                let mut role_var = VARIANT::default();
+                if acc.get_accRole(&var_child, &mut role_var).is_ok() {
+                    let role_val = role_var.Anonymous.Anonymous.Anonymous.lVal as u32;
+                    if role_val == 34 { return true; } // 34 = ROLE_SYSTEM_LISTITEM
+                }
+            }
+        }
+        false
     }
 
-    // 4. Ensure full-screen size (manual, no Tauri fullscreen)
-    if let Some(monitor) = window.primary_monitor().ok().flatten() {
-        let size = monitor.size();
-        let pos = monitor.position();
-        let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(pos.x, pos.y)));
-        let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(size.width, size.height)));
+    pub fn start_hook_thread() {
+        std::thread::spawn(|| {
+            unsafe {
+                use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+
+            unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+                if code >= 0 {
+                    let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
+                    let pt = info.pt;
+
+                    let hwnd_under = WindowFromPoint(pt);
+                    let slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
+                    let wv = HWND(get_webview_hwnd() as *mut core::ffi::c_void);
+
+                    if hwnd_under == slv && !wv.is_invalid() {
+                        if is_mouse_over_desktop_icon(pt.x, pt.y) {
+                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                        }
+
+                        let msg = wparam.0 as u32;
+                        let mut client_pt = pt;
+                        let _ = ScreenToClient(wv, &mut client_pt);
+                        let lparam_fw = ((client_pt.y as isize) << 16) | (client_pt.x as isize & 0xFFFF);
+
+                        let mut fw_wparam: usize = 0;
+                        if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
+                            fw_wparam = (info.mouseData & 0xFFFF_0000) as usize;
+                        }
+
+                        let _ = PostMessageW(wv, msg, WPARAM(fw_wparam), LPARAM(lparam_fw));
+                        return LRESULT(1);
+                    }
+                }
+                CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+            }
+
+            unsafe {
+                if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), windows::Win32::Foundation::HINSTANCE::default(), 0) {
+                    tracing::info!("Global mouse hook installed (Hybrid Mode): {:?}", h);
+                    let mut msg = MSG::default();
+                    while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            }
+        });
+    }
+}
+
+// ============================================================================
+// Visibility Watchdog
+// ============================================================================
+
+pub mod visibility_watchdog {
+    use tauri::{AppHandle, Emitter};
+
+    #[cfg(target_os = "windows")]
+    pub fn start(app: AppHandle) {
+        std::thread::spawn(move || {
+            use std::time::Duration;
+            use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GetDesktopWindow};
+            use windows::Win32::Graphics::Gdi::{MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
+            use windows::Win32::Foundation::RECT;
+
+            let mut was_visible = true;
+
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+
+                unsafe {
+                    let fg_hwnd = GetForegroundWindow();
+                    let desk_hwnd = GetDesktopWindow();
+
+                    if fg_hwnd == desk_hwnd || fg_hwnd.is_invalid() {
+                        if !was_visible {
+                            let _ = app.emit("wallpaper-visibility", true);
+                            was_visible = true;
+                        }
+                        continue;
+                    }
+
+                    let hmonitor = MonitorFromWindow(fg_hwnd, MONITOR_DEFAULTTOPRIMARY);
+                    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                    
+                    if GetMonitorInfoW(hmonitor, &mut mi).as_bool() {
+                        let mut fg_rect = RECT::default();
+                        let _ = GetWindowRect(fg_hwnd, &mut fg_rect);
+
+                        let is_fullscreen = fg_rect.left <= mi.rcMonitor.left
+                            && fg_rect.top <= mi.rcMonitor.top
+                            && fg_rect.right >= mi.rcMonitor.right
+                            && fg_rect.bottom >= mi.rcMonitor.bottom;
+
+                        let is_visible = !is_fullscreen;
+
+                        if is_visible != was_visible {
+                            was_visible = is_visible;
+                            let _ = app.emit("wallpaper-visibility", is_visible);
+                        }
+                    }
+                }
+            }
+        });
     }
 
-    let _ = window.show();
-
-    info!("Windows: Interactive Mode applied (HWND_BOTTOM)");
-    Ok(())
+    #[cfg(not(target_os = "windows"))]
+    pub fn start(_app: AppHandle) {
+        // macOS App Nap gère la pause nativement
+    }
 }
 
-// ---- macOS ------------------------------------------------------------------
+// ============================================================================
+// macOS Setup
+// ============================================================================
 
 #[cfg(target_os = "macos")]
-fn apply_desktop_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
-    let ns_window = window
-        .ns_window()
-        .map_err(|e| format!("Failed to get NSWindow: {}", e))?;
+fn setup_macos_desktop(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let ns_window = window.ns_window().map_err(|e| format!("Failed to get NSWindow: {}", e))? as *mut std::ffi::c_void;
 
-    set_macos_desktop_mode(ns_window);
-    info!("macOS: Desktop Mode applied");
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn apply_interactive_mode(window: &tauri::WebviewWindow) -> Result<(), String> {
-    let ns_window = window
-        .ns_window()
-        .map_err(|e| format!("Failed to get NSWindow: {}", e))?;
-
-    set_macos_interactive_mode(ns_window);
-    info!("macOS: Interactive Mode applied");
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn set_macos_desktop_mode(ns_window_ptr: *mut std::ffi::c_void) {
     use objc::{msg_send, sel, sel_impl};
-
     unsafe {
-        let obj = ns_window_ptr as *mut objc::runtime::Object;
-        // kCGDesktopWindowLevel = kCGMinimumWindowLevel + 20 = -2147483628 + 20 = -2147483608
-        // But the commonly used value is CGWindowLevelForKey(kCGDesktopWindowLevelKey) which is -2147483623
+        let obj = ns_window as *mut objc::runtime::Object;
+        
+        // PARITÉ EXACTE : On place la fenêtre TOUT AU FOND, derrière les icônes du Mac
         let _: () = msg_send![obj, setLevel: -2147483623_i64];
-        // canJoinAllSpaces (1) | stationary (16) | ignoresCycle (64) = 81
         let _: () = msg_send![obj, setCollectionBehavior: 81_u64];
+        
+        // On laisse la souris traverser pour que le Finder puisse détecter les clics sur les icônes
         let _: () = msg_send![obj, setIgnoresMouseEvents: true];
     }
+
+    macos_hook::start_hook_thread(window.app_handle().clone());
+    
+    info!("macOS: Desktop window setup complete (Behind icons)");
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn set_macos_interactive_mode(ns_window_ptr: *mut std::ffi::c_void) {
-    use objc::{msg_send, sel, sel_impl};
+pub mod macos_hook {
+    use tauri::{AppHandle, Emitter};
 
-    unsafe {
-        let obj = ns_window_ptr as *mut objc::runtime::Object;
-        // Between desktop icons (-2147483623) and normal apps (0).
-        // kCGDesktopWindowLevel + 23 = -2147483600
-        // This keeps us above desktop but below all normal windows.
-        let _: () = msg_send![obj, setLevel: -2147483600_i64];
-        // canJoinAllSpaces (1) | stationary (16) | ignoresCycle (64) = 81
-        let _: () = msg_send![obj, setCollectionBehavior: 81_u64];
-        let _: () = msg_send![obj, setIgnoresMouseEvents: false];
-    }
+    pub fn start_hook_thread(app: AppHandle) {
+        std::thread::spawn(move || {
+            use core_graphics::event::{CGEventTapLocation, CGEventTapPlacement, CGEventTapOptions, CGEventType, CGEventTap, CGEvent};
+            use std::time::Duration;
 
-    info!("macOS: Interactive Mode configured (level -2147483600)");
-}
+            tracing::info!("macOS: Démarrage du Hook de souris en arrière-plan (Nécessite les droits d'Accessibilité)");
 
-// ---- Linux (paused) ---------------------------------------------------------
+            loop {
+                // CORRECTION : Le callback exige 3 arguments (_proxy, cg_type, cg_event)
+                let tap_result = CGEventTap::new(
+                    CGEventTapLocation::Session,
+                    CGEventTapPlacement::HeadInsertEventTap,
+                    CGEventTapOptions::ListenOnly,
+                    vec![CGEventType::LeftMouseDown],
+                    |_proxy, cg_type, cg_event| {
+                        if cg_type == CGEventType::LeftMouseDown {
+                            let pt = cg_event.location();
+                            let _ = app.emit("mac-desktop-click", (pt.x, pt.y));
+                        }
+                        // CORRECTION : Doit renvoyer une copie de l'event pour macOS
+                        Some(cg_event.clone())
+                    },
+                );
 
-#[cfg(target_os = "linux")]
-fn apply_desktop_mode(_window: &tauri::WebviewWindow) -> Result<(), String> {
-    Err("Window layer mode is not yet supported on Linux".to_string())
-}
-
-#[cfg(target_os = "linux")]
-fn apply_interactive_mode(_window: &tauri::WebviewWindow) -> Result<(), String> {
-    Err("Window layer mode is not yet supported on Linux".to_string())
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_mode_serialization() {
-        let desktop = serde_json::to_string(&WindowLayerMode::Desktop).unwrap();
-        assert_eq!(desktop, "\"desktop\"");
-
-        let interactive = serde_json::to_string(&WindowLayerMode::Interactive).unwrap();
-        assert_eq!(interactive, "\"interactive\"");
-
-        let parsed: WindowLayerMode = serde_json::from_str("\"desktop\"").unwrap();
-        assert_eq!(parsed, WindowLayerMode::Desktop);
-    }
-
-    #[test]
-    fn test_state_default() {
-        let state = WindowLayerState::new();
-        let mode = state.mode.lock().unwrap();
-        assert_eq!(*mode, WindowLayerMode::Interactive);
+                match tap_result {
+                    Ok(tap) => {
+                        tracing::info!("macOS: Hook souris attaché avec succès !");
+                        let run_loop_source = tap.mach_port.create_runloop_source(0).unwrap();
+                        core_foundation::runloop::CFRunLoop::get_current().add_source(&run_loop_source, core_foundation::runloop::kCFRunLoopCommonModes);
+                        
+                        tap.enable();
+                        core_foundation::runloop::CFRunLoop::run_current();
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!("macOS: Droits d'accessibilité manquants. En attente de l'autorisation...");
+                        std::thread::sleep(Duration::from_secs(3));
+                    }
+                }
+            }
+        });
     }
 }

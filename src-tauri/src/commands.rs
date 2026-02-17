@@ -8,7 +8,7 @@ use tauri::{Emitter, Manager};
 use tracing::info;
 
 // Re-export core types so existing `use crate::commands::*` still works
-pub use commands_core::{LayerInfo, SystemInfo, UpdateInfo};
+pub use commands_core::{SystemInfo, UpdateInfo};
 
 // ============================================================================
 // System Information
@@ -180,31 +180,6 @@ pub fn reload_window(app: tauri::AppHandle) -> Result<(), String> {
             .map_err(|e| format!("Failed to emit reload event: {}", e))?;
     }
 
-    Ok(())
-}
-
-// ============================================================================
-// Layer Management Commands
-// ============================================================================
-
-/// Get current layers from the frontend
-#[tauri::command]
-pub async fn get_layers(app: tauri::AppHandle) -> Result<Vec<LayerInfo>, String> {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.emit("request-layers", ());
-    }
-    Ok(vec![])
-}
-
-/// Toggle a layer's visibility
-#[tauri::command]
-pub async fn toggle_layer(app: tauri::AppHandle, layer_id: String) -> Result<(), String> {
-    info!("Toggling layer: {}", layer_id);
-    if let Some(window) = app.get_webview_window("main") {
-        window
-            .emit("toggle-layer", &layer_id)
-            .map_err(|e| format!("Failed to emit toggle-layer event: {}", e))?;
-    }
     Ok(())
 }
 
