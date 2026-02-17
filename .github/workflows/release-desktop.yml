@@ -118,6 +118,12 @@ jobs:
           echo "CARGO_PROFILE_RELEASE_INCREMENTAL=true" >> $GITHUB_ENV
           echo "CARGO_INCREMENTAL=1" >> $GITHUB_ENV
 
+      - name: Clear stale updater manifest
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete-asset "${{ needs.bump-version.outputs.tag }}" latest.json --yes --repo ${{ github.repository }} 2>/dev/null || true
+
       - name: Build and publish
         uses: tauri-apps/tauri-action@v0.5
         env:
@@ -134,6 +140,7 @@ jobs:
 
   publish-release:
     needs: [bump-version, publish-tauri]
+    if: ${{ !cancelled() && needs.bump-version.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
