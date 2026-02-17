@@ -7,6 +7,7 @@
 
 use tracing::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::Manager;
 
 // Flag de sécurité pour ne pas spammer le système à la fermeture
 static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
@@ -350,11 +351,11 @@ fn setup_macos_desktop(window: &tauri::WebviewWindow) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 pub mod macos_hook {
-    use tauri::{AppHandle, Emitter};
+    use tauri::AppHandle;
 
     pub fn start_hook_thread(app: AppHandle) {
         std::thread::spawn(move || {
-            use core_graphics::event::{CGEventTapLocation, CGEventTapPlacement, CGEventTapOptions, CGEventType, CGEventTap, CGEvent};
+            use core_graphics::event::{CGEventTapLocation, CGEventTapPlacement, CGEventTapOptions, CGEventType, CGEventTap};
             use std::time::Duration;
 
             tracing::info!("macOS: Démarrage du Hook de souris en arrière-plan (Nécessite les droits d'Accessibilité)");
@@ -367,7 +368,7 @@ pub mod macos_hook {
                     CGEventTapOptions::ListenOnly,
                     vec![CGEventType::LeftMouseDown],
                     |_proxy, cg_type, cg_event| {
-                        if cg_type == CGEventType::LeftMouseDown {
+                        if matches!(cg_type, CGEventType::LeftMouseDown) {
                             let pt = cg_event.location();
                             let _ = app.emit("mac-desktop-click", (pt.x, pt.y));
                         }
