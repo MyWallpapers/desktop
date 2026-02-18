@@ -12,8 +12,9 @@ src-tauri/
 │   ├── main.rs            # Entry point
 │   ├── lib.rs             # App init, plugins, window setup
 │   ├── commands.rs        # Tauri IPC commands
-│   ├── tray.rs            # System tray menu
-│   └── desktop_clone.rs   # OS wallpaper & desktop icon extraction
+│   ├── commands_core.rs   # Platform-independent business logic
+│   ├── tray.rs            # System tray (quit only)
+│   └── window_layer.rs    # Desktop injection, mouse engine, visibility watchdog
 ├── icons/                 # App icons (all platforms)
 ├── capabilities/          # Tauri permission capabilities
 ├── tauri.conf.json        # Tauri configuration
@@ -30,17 +31,12 @@ src-tauri/
 | `restart_app` | Restart to apply update |
 | `open_oauth_in_browser` | Open OAuth URL in default browser |
 | `reload_window` | Emit reload event to frontend |
-| `get_layers` / `toggle_layer` | Layer visibility management via tray |
-| `get_os_wallpaper` | Extract current OS wallpaper as base64 |
-| `get_desktop_icons` | List desktop icons with images |
-| `open_desktop_item` | Open file/folder with system handler |
-| `proxy_fetch` | Localhost HTTP proxy (Linux mixed-content workaround) |
+| `set_desktop_icons_visible` | Show/hide native desktop icons |
 
 ### Platform-specific behavior
 
-- **Windows**: Registry-based wallpaper detection, `SHGetFileInfoW` for icons, transparent window
-- **macOS**: `osascript` for wallpaper, `sips`/`qlmanage` for icons, transparent window
-- **Linux**: GNOME/KDE wallpaper detection, XDG icon themes, opaque dark background (WebKitGTK compositing), X11 `_NET_WM_WINDOW_TYPE_DESKTOP`, fetch proxy for mixed-content
+- **Windows**: WorkerW injection (Win11 24H2+ and Legacy), MSAA mouse hook with icon detection, transparent window
+- **macOS**: `kCGDesktopWindowLevel` behind desktop icons, Finder-based icon toggle, transparent window
 
 ## Releasing
 

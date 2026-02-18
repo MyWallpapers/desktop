@@ -5,7 +5,7 @@
 //!          Native icons (ROLE_SYSTEM_LISTITEM) are ignored and process clicks natively.
 //! macOS: kCGDesktopWindowLevel set behind desktop icons. Native icon hiding via Finder defaults.
 
-use log::{info, warn, error, debug};
+use log::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // Flag de sécurité pour ne pas spammer le système à la fermeture
@@ -33,7 +33,7 @@ pub fn setup_desktop_window(window: &tauri::WebviewWindow) {
 
 /// Commande Tauri appelée depuis le Frontend (JS/TS) pour masquer les icônes
 #[tauri::command]
-pub fn set_desktop_icons_visible(_visible: bool) -> Result<(), String> {
+pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
@@ -43,9 +43,9 @@ pub fn set_desktop_icons_visible(_visible: bool) -> Result<(), String> {
         if slv_hwnd != 0 {
             let slv = HWND(slv_hwnd as *mut core::ffi::c_void);
             unsafe {
-                let _ = ShowWindow(slv, if _visible { SW_SHOW } else { SW_HIDE });
+                let _ = ShowWindow(slv, if visible { SW_SHOW } else { SW_HIDE });
             }
-            info!("Windows: Desktop icons visibility set to {}", _visible);
+            info!("Windows: Desktop icons visibility set to {}", visible);
         } else {
             warn!("Cannot toggle icons: SysListView32 not found yet.");
         }
@@ -53,15 +53,14 @@ pub fn set_desktop_icons_visible(_visible: bool) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        // Sur macOS, on désactive l'affichage du bureau via le Finder
-        let val = if _visible { "true" } else { "false" };
+        let val = if visible { "true" } else { "false" };
         let _ = std::process::Command::new("defaults")
             .args(["write", "com.apple.finder", "CreateDesktop", val])
             .output();
         let _ = std::process::Command::new("killall")
             .arg("Finder")
             .output();
-        info!("macOS: Desktop icons visibility set to {}", _visible);
+        info!("macOS: Desktop icons visibility set to {}", visible);
     }
 
     Ok(())
@@ -224,7 +223,6 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-#[cfg(target_os = "windows")]
 pub mod mouse_hook {
     use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
@@ -318,7 +316,7 @@ pub mod mouse_hook {
 
                         // 2. LE CACHE PROPRE
                         let mut target = HWND(RENDER_WIDGET_HWND.load(Ordering::Relaxed) as *mut _);
-                        if target.is_invalid() || !IsWindow(target).as_bool() {
+                        if target.is_invalid() || !IsWindow(target).as_bool() || !IsChild(wv, target).as_bool() {
                             struct S { res: HWND }
                             let mut s = S { res: HWND::default() };
                             unsafe extern "system" fn cb(h: HWND, l: LPARAM) -> BOOL {
@@ -364,7 +362,7 @@ pub mod mouse_hook {
 
                         if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
 
-                        if msg != WM_MOUSEMOVE {
+                        if msg != WM_MOUSEMOVE || state == STATE_WEB {
                             return LRESULT(1);
                         }
                     }
@@ -487,61 +485,6 @@ fn setup_macos_desktop(window: &tauri::WebviewWindow) -> Result<(), String> {
         let _: () = msg_send![ns_window, setIgnoresMouseEvents: true];
     }
 
-    macos_hook::start_hook_thread(window.app_handle().clone());
-    
     info!("macOS: Desktop window setup complete (Behind icons)");
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-pub mod macos_hook {
-    use tauri::{AppHandle, Emitter};
-
-    pub fn start_hook_thread(app: AppHandle) {
-        std::thread::spawn(move || {
-            use core_graphics::event::{CGEventTapLocation, CGEventTapPlacement, CGEventTapOptions, CGEventType, CGEventTap};
-            use std::time::Duration;
-
-            log::info!("macOS: Démarrage du Hook de souris en arrière-plan (Nécessite les droits d'Accessibilité)");
-
-            loop {
-                let tap_result = CGEventTap::new(
-                    CGEventTapLocation::Session,
-                    CGEventTapPlacement::HeadInsertEventTap,
-                    CGEventTapOptions::ListenOnly,
-                    vec![CGEventType::LeftMouseDown],
-                    |_proxy, cg_type, cg_event| {
-                        if matches!(cg_type, CGEventType::LeftMouseDown) {
-                            let pt = cg_event.location();
-                            let _ = app.emit("mac-desktop-click", (pt.x, pt.y));
-                        }
-                        Some(cg_event.clone())
-                    },
-                );
-
-                match tap_result {
-                    Ok(tap) => {
-                        log::info!("macOS: Hook souris attaché avec succès !");
-                        let run_loop_source = tap.mach_port.create_runloop_source(0).unwrap();
-                        
-                        unsafe {
-                            // Block unsafe nécessaire pour appeler les constantes C d'Apple
-                            core_foundation::runloop::CFRunLoop::get_current().add_source(
-                                &run_loop_source, 
-                                core_foundation::runloop::kCFRunLoopCommonModes
-                            );
-                        }
-                        
-                        tap.enable();
-                        core_foundation::runloop::CFRunLoop::run_current();
-                        break;
-                    }
-                    Err(_) => {
-                        log::warn!("macOS: Droits d'accessibilité manquants. En attente de l'autorisation...");
-                        std::thread::sleep(Duration::from_secs(3));
-                    }
-                }
-            }
-        });
-    }
 }
