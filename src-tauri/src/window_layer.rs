@@ -320,10 +320,6 @@ pub mod mouse_hook {
     // WM_MOUSELEAVE n'est pas dans WindowsAndMessaging — défini manuellement
     const WM_MOUSELEAVE: u32 = 0x02A3;
 
-    // Classe UTF-16 pour comparaison rapide sans allocation
-    const PROGMAN_U16: [u16; 7] = [80, 114, 111, 103, 109, 97, 110]; // "Progman"
-    const WORKERW_U16: [u16; 7] = [87, 111, 114, 107, 101, 114, 87]; // "WorkerW"
-
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SHELL_VIEW_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -446,8 +442,8 @@ pub mod mouse_hook {
                             let root = GetAncestor(hwnd_under, GA_ROOT);
                             let fg = GetForegroundWindow();
 
-                            // A) Si la fenêtre est au premier plan → c'est une vraie app, pas d'override
-                            // B) Sinon, vérifier les styles d'overlay + PID non-Explorer
+                            // Si la fenêtre est au premier plan → c'est une vraie app, pas d'override
+                            // Sinon, vérifier les styles d'overlay + PID non-Explorer
                             if root != fg && hwnd_under != fg && !root.is_invalid() {
                                 let ex = GetWindowLongW(root, GWL_EXSTYLE) as u32;
                                 let is_overlay_style = (ex & WS_EX_NOACTIVATE.0) != 0
@@ -461,18 +457,6 @@ pub mod mouse_hook {
                                     if overlay_pid != explorer_pid && overlay_pid != 0 {
                                         is_over_desktop = true;
                                     }
-                                }
-                            }
-
-                            // C) Fallback Lively-style : si le foreground EST le bureau (Progman/WorkerW),
-                            // alors on est sur le desktop même si un overlay bloque WindowFromPoint
-                            if !is_over_desktop {
-                                let mut fg_cn = [0u16; 16];
-                                let fg_len = GetClassNameW(fg, &mut fg_cn) as usize;
-                                if fg.is_invalid()
-                                    || (fg_len == 7 && (fg_cn[..7] == PROGMAN_U16 || fg_cn[..7] == WORKERW_U16))
-                                {
-                                    is_over_desktop = true;
                                 }
                             }
                         }
