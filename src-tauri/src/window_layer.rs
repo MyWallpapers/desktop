@@ -148,7 +148,6 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         }
 
         // 2. MÉTHODE PROPRE : Polling (Boucle de tentative) 
-        // On vérifie jusqu'à 10 fois toutes les 50ms pour laisser Windows travailler
         let mut attempts = 0;
         while attempts < 10 {
             let _ = EnumWindows(Some(callback), LPARAM(&mut found as *mut Found as isize));
@@ -159,10 +158,24 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
             attempts += 1;
         }
 
+        // --- GESTION DU FALLBACK SI WORKERW ÉCHOUE ---
         if found.worker_w.is_invalid() {
-            return Err("WorkerW n'a pas pu être généré par Windows dans les temps.".to_string());
+            warn!("WorkerW introuvable. Activation du Fallback d'urgence (HWND_BOTTOM).");
+            
+            // PLAN B : Méthode HWND_BOTTOM (Infaillible)
+            // On force la fenêtre tout au fond, derrière toutes les applications.
+            let _ = SetWindowPos(
+                our_hwnd, 
+                HWND_BOTTOM, 
+                0, 0, 0, 0, 
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+            );
+            
+            mouse_hook::start_hook_thread();
+            return Ok(());
         }
 
+        // --- PLAN A : INJECTION DANS WORKERW ---
         mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
         if !found.sys_list_view.is_invalid() {
             mouse_hook::set_syslistview_hwnd(found.sys_list_view.0 as isize);
@@ -171,18 +184,14 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         let current_parent = GetParent(our_hwnd);
         if current_parent != Ok(found.worker_w) {
             
-            // On s'assure que la fenêtre agit comme un fond d'écran (Win11)
+            // Sécurité styles pour l'injection
             let mut style = GetWindowLongW(our_hwnd, GWL_STYLE);
             style &= !(WS_POPUP.0 as i32); 
             style |= WS_CHILD.0 as i32;    
             let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style);
 
-            // 3. Injection derrière les icônes
             let _ = SetParent(our_hwnd, found.worker_w);
             
-            // MÉTHODE PROPRE : SWP_NOSIZE | SWP_NOMOVE
-            // On fait confiance aux calculs de taille faits par Tauri dans `src/lib.rs`.
-            // On ne tente plus de lire la taille erratique du WorkerW.
             let _ = SetWindowPos(
                 our_hwnd, 
                 HWND::default(), 
