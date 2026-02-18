@@ -230,7 +230,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 pub mod mouse_hook {
     use std::sync::atomic::{AtomicIsize, AtomicBool, Ordering};
     use std::sync::OnceLock;
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -238,7 +238,6 @@ pub mod mouse_hook {
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
-    // NOUVEAU : Machine à états pour mémoriser les actions de l'utilisateur (Drag & Drop)
     static IS_NATIVE_DRAG: AtomicBool = AtomicBool::new(false);
     static IS_WEB_DRAG: AtomicBool = AtomicBool::new(false);
 
@@ -261,7 +260,7 @@ pub mod mouse_hook {
             if let Some(acc) = p_acc {
                 if let Ok(role_var) = acc.get_accRole(&var_child) {
                     if let Ok(role_val) = i32::try_from(&role_var) {
-                        if role_val == 34 { return true; } // ROLE_SYSTEM_LISTITEM
+                        if role_val == 34 { return true; } 
                     }
                 }
             }
@@ -288,62 +287,74 @@ pub mod mouse_hook {
 
                     if (hwnd_under == slv || hwnd_under == wv) && !wv.is_invalid() {
                         
-                        // Détection des actions d'appui et de relâchement
                         let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
                         let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
                         let is_click_event = is_down || is_up || msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK;
 
-                        // 1. GESTION DES ÉTATS (Le correctif du Drag & Drop)
                         if is_down {
                             if is_mouse_over_desktop_icon(pt.x, pt.y) {
-                                // On clique sur une icône : On verrouille le mode NATIVE
                                 IS_NATIVE_DRAG.store(true, Ordering::SeqCst);
                                 IS_WEB_DRAG.store(false, Ordering::SeqCst);
                                 return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             } else {
-                                // On clique dans le vide : On verrouille le mode WEB
                                 IS_NATIVE_DRAG.store(false, Ordering::SeqCst);
                                 IS_WEB_DRAG.store(true, Ordering::SeqCst);
                             }
                         } else if IS_NATIVE_DRAG.load(Ordering::SeqCst) {
-                            // Si on glisse une icône, on continue de donner les commandes à Windows
                             if is_up { IS_NATIVE_DRAG.store(false, Ordering::SeqCst); }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         } else if IS_WEB_DRAG.load(Ordering::SeqCst) {
-                            // Si on glisse sur le web, on continue de donner les commandes au web
                             if is_up { IS_WEB_DRAG.store(false, Ordering::SeqCst); }
                         } else {
-                            // Mouvement simple (sans clic enfoncé)
                             if is_mouse_over_desktop_icon(pt.x, pt.y) {
                                 return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             }
                         }
-
-                        // --- PARTIE WEBVIEW (L'évènement arrive ici UNIQUEMENT s'il est pour le site web) ---
                         
                         let mut client_pt = pt;
                         let _ = ScreenToClient(wv, &mut client_pt);
-                        let lparam_fw = ((client_pt.y as isize) << 16) | (client_pt.x as isize & 0xFFFF);
+                        
+                        // CORRECTION 1 : Formatage mathématique robuste des coordonnées
+                        let lparam_fw = ((client_pt.y as u16 as isize) << 16) | (client_pt.x as u16 as isize);
 
                         let mut fw_wparam: usize = 0;
                         match msg {
                             WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK => fw_wparam = 0x0001,
                             WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK => fw_wparam = 0x0002,
+                            WM_MOUSEMOVE => {
+                                // CORRECTION 2 : Si on drag un élément sur le web, on maintient la pression du clic
+                                if IS_WEB_DRAG.load(Ordering::SeqCst) {
+                                    fw_wparam = 0x0001; 
+                                }
+                            }
                             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => fw_wparam = (info.mouseData & 0xFFFF_0000) as usize,
                             _ => {}
                         }
 
-                        let mut target_hwnd = wv;
-                        let cw0 = FindWindowExW(wv, HWND::default(), windows::core::w!("Chrome_WidgetWin_0"), None).unwrap_or(HWND::default());
-                        if !cw0.is_invalid() {
-                            let crw = FindWindowExW(cw0, HWND::default(), windows::core::w!("Chrome_RenderWidgetHostHWND"), None).unwrap_or(HWND::default());
-                            if !crw.is_invalid() { target_hwnd = crw; }
+                        // CORRECTION 3 : Le Scanner Profond.
+                        // On ignore le nom des dossiers parents et on fouille jusqu'à trouver le moteur Chromium.
+                        struct SearchData { result: HWND }
+                        let mut search = SearchData { result: HWND::default() };
+                        unsafe extern "system" fn enum_cb(h: HWND, l: LPARAM) -> BOOL {
+                            let mut class_name = [0u16; 256];
+                            let len = GetClassNameW(h, &mut class_name);
+                            if len > 0 {
+                                let name = String::from_utf16_lossy(&class_name[..len as usize]);
+                                if name.starts_with("Chrome_RenderWidgetHostHWND") {
+                                    let d = &mut *(l.0 as *mut SearchData);
+                                    d.result = h;
+                                    return BOOL(0); // Moteur trouvé, on arrête !
+                                }
+                            }
+                            BOOL(1) // Continuer de fouiller
                         }
+                        let _ = EnumChildWindows(wv, Some(enum_cb), LPARAM(&mut search as *mut SearchData as isize));
+                        let target_hwnd = if !search.result.is_invalid() { search.result } else { wv };
 
-                        // Envoi de tous les évènements de souris (Hover, Scroll)
+                        // On envoie le mouvement et les clics au bon moteur
                         let _ = PostMessageW(target_hwnd, msg, WPARAM(fw_wparam), LPARAM(lparam_fw));
 
-                        // Forçage JavaScript pour les clics gauche
+                        // CORRECTION 4 : Le contournement DPI en Javascript
                         if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP {
                             if let Some(app) = APP_HANDLE.get() {
                                 use tauri::Manager;
@@ -353,8 +364,12 @@ pub mod mouse_hook {
                                         "el.dispatchEvent(new MouseEvent('click', {bubbles: true, clientX: x, clientY: y}));" 
                                     } else { "" };
 
+                                    // On divise les coordonnées par "devicePixelRatio" pour s'adapter à l'échelle de l'écran Windows !
                                     let js = format!(
-                                        "(function(x, y) {{
+                                        "(function(physX, physY) {{
+                                            var scale = window.devicePixelRatio || 1;
+                                            var x = physX / scale;
+                                            var y = physY / scale;
                                             var el = document.elementFromPoint(x, y);
                                             if(el) {{
                                                 el.dispatchEvent(new MouseEvent('{}', {{bubbles: true, clientX: x, clientY: y}}));
@@ -368,8 +383,6 @@ pub mod mouse_hook {
                             }
                         }
 
-                        // On bloque Windows de dessiner son carré bleu si c'est un clic, 
-                        // mais on le laisse gérer les mouvements simples de souris.
                         if is_click_event {
                             return LRESULT(1);
                         } else {
@@ -382,7 +395,7 @@ pub mod mouse_hook {
 
             unsafe {
                 if let Ok(_h) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), windows::Win32::Foundation::HINSTANCE::default(), 0) {
-                    log::info!("Global mouse hook installed with Drag&Drop Engine");
+                    log::info!("Global mouse hook installed (Scanner profond actif)");
                     let mut msg = MSG::default();
                     while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
                         let _ = TranslateMessage(&msg);

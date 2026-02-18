@@ -2339,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "mywallpaper-desktop"
-version = "1.0.65"
+version = "1.0.66"
 dependencies = [
  "core-foundation 0.9.4",
  "core-graphics 0.23.2",
