@@ -65,6 +65,23 @@ jobs:
           git tag "${{ steps.bump.outputs.tag }}"
           git push origin main "${{ steps.bump.outputs.tag }}"
 
+      # Create the draft release ONCE here, before matrix builds start.
+      # This prevents tauri-action race conditions where multiple matrix jobs
+      # each create a separate release with the same tag.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.bump.outputs.tag }}"
+          PRERELEASE="${{ inputs.mode == 'dev' && '--prerelease' || '' }}"
+          BODY="See the assets to download and install.${{ inputs.mode == 'dev' && ' ⚠️ DEV BUILD — unoptimized, devtools enabled.' || '' }}"
+          gh release create "$TAG" \
+            --draft \
+            $PRERELEASE \
+            --title "MyWallpaper Desktop ${TAG}" \
+            --notes "$BODY" \
+            --repo ${{ github.repository }}
+
   publish-tauri:
     needs: bump-version
     permissions:
