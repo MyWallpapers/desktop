@@ -587,21 +587,19 @@ pub mod mouse_hook {
                             wp = (info.mouseData & 0xFFFF0000) as usize;
                         }
 
-                        // 4. INJECTION DIRECTE
-                        // WM_MOUSEWHEEL: poster au WebView parent (Chromium route depuis le parent)
-                        // Autres messages: poster au Chrome_RenderWidgetHostHWND directement
-                        let post_target = if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL { wv } else { target };
+                        // 4. INJECTION DIRECTE — toujours vers Chrome_RenderWidgetHostHWND
                         if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                            log::info!("[MOUSE] wheel fwd → wv=0x{:X} wp=0x{:X} lp=0x{:X}",
-                                wv.0 as isize, wp, lp);
+                            log::info!("[MOUSE] wheel fwd → target=0x{:X} wp=0x{:X} lp=0x{:X}",
+                                target.0 as isize, wp, lp);
                         }
-                        let _ = PostMessageW(post_target, msg, WPARAM(wp), LPARAM(lp));
+                        let _ = PostMessageW(target, msg, WPARAM(wp), LPARAM(lp));
 
                         if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
 
-                        if msg != WM_MOUSEMOVE || state == STATE_WEB {
-                            return LRESULT(1);
-                        }
+                        // CONSUMER le message original pour empêcher Windows de le livrer à l'overlay.
+                        // Sans ça, Chrome reçoit WM_MOUSELEAVE (via TrackMouseEvent) car le système
+                        // voit le curseur sur l'overlay, pas sur Chrome → hover impossible.
+                        return LRESULT(1);
                     }
                 }
                 CallNextHookEx(HHOOK::default(), code, wparam, lparam)
