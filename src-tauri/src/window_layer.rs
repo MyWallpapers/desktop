@@ -322,6 +322,7 @@ pub mod mouse_hook {
     static SHELL_VIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static TARGET_PARENT_HWND: AtomicIsize = AtomicIsize::new(0);
     static RENDER_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0);
+    static EXPLORER_PID: AtomicU32 = AtomicU32::new(0);
 
     static HOOK_STATE: AtomicU8 = AtomicU8::new(0);
     const STATE_IDLE: u8 = 0;
@@ -337,7 +338,15 @@ pub mod mouse_hook {
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_shell_view_hwnd(hwnd: isize) { SHELL_VIEW_HWND.store(hwnd, Ordering::SeqCst); }
-    pub fn set_target_parent_hwnd(hwnd: isize) { TARGET_PARENT_HWND.store(hwnd, Ordering::SeqCst); }
+    pub fn set_target_parent_hwnd(hwnd: isize) {
+        TARGET_PARENT_HWND.store(hwnd, Ordering::SeqCst);
+        // Cache Explorer PID from the target parent (Progman/WorkerW)
+        if hwnd != 0 {
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid)); }
+            EXPLORER_PID.store(pid, Ordering::SeqCst);
+        }
+    }
     pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
 
@@ -411,12 +420,30 @@ pub mod mouse_hook {
                         let sv = HWND(SHELL_VIEW_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void);
                         let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void);
 
-                        let is_over_desktop = hwnd_under == slv
+                        let mut is_over_desktop = hwnd_under == slv
                             || hwnd_under == wv
                             || hwnd_under == sv    // SHELLDLL_DefView
                             || hwnd_under == tp    // Progman (24H2) ou WorkerW (Legacy)
                             || IsChild(wv, hwnd_under).as_bool()   // Chrome_RenderWidgetHostHWND etc.
                             || IsChild(tp, hwnd_under).as_bool();  // Tout enfant du parent desktop
+
+                        // Détection d'overlay système (Win11 Widgets/Copilot/Search)
+                        // Ces fenêtres sont transparentes visuellement mais bloquent WindowFromPoint.
+                        // On les identifie par : WS_EX_NOACTIVATE + process différent d'Explorer
+                        if !is_over_desktop {
+                            let root = GetAncestor(hwnd_under, GA_ROOT);
+                            if !root.is_invalid() {
+                                let ex = GetWindowLongW(root, GWL_EXSTYLE) as u32;
+                                if (ex & WS_EX_NOACTIVATE.0) != 0 {
+                                    let explorer_pid = EXPLORER_PID.load(Ordering::Relaxed);
+                                    let mut overlay_pid = 0u32;
+                                    GetWindowThreadProcessId(root, Some(&mut overlay_pid));
+                                    if overlay_pid != explorer_pid && overlay_pid != 0 {
+                                        is_over_desktop = true;
+                                    }
+                                }
+                            }
+                        }
 
                         // Diagnostic logging (sampled: 1/500 moves, all wheel events)
                         if msg == WM_MOUSEMOVE {
@@ -528,6 +555,10 @@ pub mod mouse_hook {
                         }
 
                         // 4. INJECTION DIRECTE
+                        if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
+                            log::info!("[MOUSE] wheel fwd → target=0x{:X} wp=0x{:X} lp=0x{:X}",
+                                target.0 as isize, wp, lp);
+                        }
                         let _ = PostMessageW(target, msg, WPARAM(wp), LPARAM(lp));
 
                         if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
