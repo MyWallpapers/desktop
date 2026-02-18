@@ -115,92 +115,103 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     let our_hwnd = HWND(our_hwnd.0 as *mut core::ffi::c_void);
 
     unsafe {
-        // 1. On récupère le gestionnaire de bureau principal
         let progman = FindWindowW(windows::core::w!("Progman"), None)
             .map_err(|_| "Could not find Progman".to_string())?;
 
-        // 2. L'ordre de scission officiel (Message 0x052C)
-        // C'est le message interne de Microsoft. On l'envoie une seule fois, proprement.
-        let mut msg_result: usize = 0;
-        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
-
-        // Structure pour récupérer simultanément nos deux cibles
-        struct LayerData {
-            worker_w: HWND,
-            sys_list_view: HWND,
-        }
-        let mut data = LayerData { worker_w: HWND::default(), sys_list_view: HWND::default() };
-
-        // 3. La logique de recherche absolue
-        unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-            let data = &mut *(lparam.0 as *mut LayerData);
+        // 1. DÉTECTION WINDOWS 11 24H2+ (La nouvelle architecture Microsoft)
+        // On vérifie si les icônes sont enfermées directement dans Progman.
+        let shell_in_progman = FindWindowExW(progman, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or(HWND::default());
+        
+        if !shell_in_progman.is_invalid() {
+            log::info!("Architecture Windows 11 24H2+ détectée.");
             
-            // On cherche la fenêtre qui abrite le système d'icônes
-            if let Ok(shell) = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None) {
-                
-                // On récupère la grille d'icônes (pour notre hook de souris)
-                if let Ok(slv) = FindWindowExW(shell, HWND::default(), windows::core::w!("SysListView32"), None) {
-                    data.sys_list_view = slv;
-                }
-                
-                // RÈGLE D'OR DE L'OS : Le fond d'écran (WorkerW) est TOUJOURS le frère 
-                // qui suit immédiatement le conteneur d'icônes dans la hiérarchie.
-                // (On ne vérifie pas IsWindowVisible car DWM ne l'a pas encore peinte !)
-                if let Ok(w) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
-                    data.worker_w = w;
-                }
-                
-                return BOOL(0); // On a nos fenêtres, on stoppe la recherche
-            }
-            BOOL(1) // Sinon on continue de fouiller
-        }
-
-        // 4. Exécution de la recherche (On laisse à DWM max 1 seconde pour s'exécuter)
-        let mut attempts = 0;
-        while attempts < 10 {
-            let _ = EnumWindows(Some(callback), LPARAM(&mut data as *mut LayerData as isize));
-            if !data.worker_w.is_invalid() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            attempts += 1;
-        }
-
-        // 5. Gestion stricte des erreurs (PAS DE FALLBACK)
-        if data.worker_w.is_invalid() {
-            return Err("Erreur critique: Windows n'a pas généré le WorkerW d'arrière-plan.".to_string());
-        }
-
-        // On transmet les HWND au thread de la souris
-        mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
-        if !data.sys_list_view.is_invalid() {
-            mouse_hook::set_syslistview_hwnd(data.sys_list_view.0 as isize);
-        }
-
-        let current_parent = GetParent(our_hwnd);
-        if current_parent != Ok(data.worker_w) {
-            
-            // 6. ADAPTATION OS (Windows 11 vs Windows 10)
-            // L'API Desktop Window Manager (DWM) de Windows 11 a changé ses règles de sécurité.
-            // Elle interdit formellement à une fenêtre "POPUP" de s'injecter sous les icônes.
-            // On convertit notre fenêtre en "CHILD" de force pour respecter l'OS.
+            // On force le style Enfant pour respecter DWM
             let mut style = GetWindowLongW(our_hwnd, GWL_STYLE);
             style &= !(WS_POPUP.0 as i32); 
             style |= WS_CHILD.0 as i32;    
             let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style);
 
-            // 7. L'injection finale et parfaite
-            let _ = SetParent(our_hwnd, data.worker_w);
+            // On s'injecte directement dans Progman
+            let _ = SetParent(our_hwnd, progman);
             
-            // On fige la position et la taille (Tauri s'en occupe, pas Windows)
+            // On glisse notre app juste en dessous des icônes dans le Z-Order !
+            let _ = SetWindowPos(
+                our_hwnd, 
+                shell_in_progman, // L'astuce est là : on se met "derrière" shell_in_progman
+                0, 0, 0, 0, 
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE
+            );
+            
+            // Configuration du Hook de souris
+            mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
+            if let Ok(slv) = FindWindowExW(shell_in_progman, HWND::default(), windows::core::w!("SysListView32"), None) {
+                if !slv.is_invalid() {
+                    mouse_hook::set_syslistview_hwnd(slv.0 as isize);
+                }
+            }
+
+            log::info!("Injected native Webview perfectly behind desktop icons (24H2 Mode).");
+
+        } else {
+            // 2. ARCHITECTURE CLASSIQUE (Windows 10 & Win 11 < 24H2)
+            log::info!("Architecture Windows Legacy détectée.");
+            
+            let mut msg_result: usize = 0;
+            let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
+            let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(0), SMTO_NORMAL, 1000, Some(&mut msg_result));
+            let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
+
+            struct LayerData {
+                worker_w: HWND,
+                sys_list_view: HWND,
+            }
+            let mut data = LayerData { worker_w: HWND::default(), sys_list_view: HWND::default() };
+
+            unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+                let data = &mut *(lparam.0 as *mut LayerData);
+                if let Ok(shell) = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None) {
+                    if let Ok(slv) = FindWindowExW(shell, HWND::default(), windows::core::w!("SysListView32"), None) {
+                        data.sys_list_view = slv;
+                    }
+                    if let Ok(w) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
+                        data.worker_w = w;
+                    }
+                    return BOOL(0);
+                }
+                BOOL(1)
+            }
+
+            let mut attempts = 0;
+            while attempts < 15 { // 1.5 seconde max pour laisser Windows scinder le bureau
+                let _ = EnumWindows(Some(callback), LPARAM(&mut data as *mut LayerData as isize));
+                if !data.worker_w.is_invalid() { break; }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                attempts += 1;
+            }
+
+            if data.worker_w.is_invalid() {
+                return Err("Erreur critique: Windows n'a pas généré le WorkerW d'arrière-plan.".to_string());
+            }
+
+            let mut style = GetWindowLongW(our_hwnd, GWL_STYLE);
+            style &= !(WS_POPUP.0 as i32); 
+            style |= WS_CHILD.0 as i32;    
+            let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style);
+
+            let _ = SetParent(our_hwnd, data.worker_w);
             let _ = SetWindowPos(
                 our_hwnd, 
                 HWND::default(), 
                 0, 0, 0, 0, 
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE
             );
+
+            mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
+            if !data.sys_list_view.is_invalid() {
+                mouse_hook::set_syslistview_hwnd(data.sys_list_view.0 as isize);
+            }
             
-            log::info!("Injected native Webview perfectly behind desktop icons.");
+            log::info!("Injected native Webview perfectly behind desktop icons (Legacy Mode).");
         }
     }
 
