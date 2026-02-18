@@ -112,7 +112,6 @@ pub fn restore_desktop_icons() {
 
 #[cfg(target_os = "windows")]
 fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use tauri::Manager;
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -224,31 +223,28 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         }
     }
 
-    // ON DONNE L'APP AU HOOK ICI
-    mouse_hook::set_app_handle(window.app_handle().clone());
     mouse_hook::start_hook_thread();
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicIsize, AtomicBool, Ordering};
-    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
-    static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
-    static IS_NATIVE_DRAG: AtomicBool = AtomicBool::new(false);
-    static IS_WEB_DRAG: AtomicBool = AtomicBool::new(false);
+    // Machine à états : 0 = IDLE, 1 = DRAGGING_NATIVE (icône), 2 = DRAGGING_WEB
+    static HOOK_STATE: AtomicU8 = AtomicU8::new(0);
+    const STATE_IDLE: u8 = 0;
+    const STATE_NATIVE: u8 = 1;
+    const STATE_WEB: u8 = 2;
 
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
-    pub fn set_app_handle(app: tauri::AppHandle) { let _ = APP_HANDLE.set(app); }
-    
     pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
 
@@ -264,7 +260,7 @@ pub mod mouse_hook {
             if let Some(acc) = p_acc {
                 if let Ok(role_var) = acc.get_accRole(&var_child) {
                     if let Ok(role_val) = i32::try_from(&role_var) {
-                        if role_val == 34 { return true; } 
+                        if role_val == 34 { return true; } // ROLE_SYSTEM_LISTITEM
                     }
                 }
             }
@@ -285,112 +281,73 @@ pub mod mouse_hook {
                     let pt = info.pt;
                     let msg = wparam.0 as u32;
 
-                    let hwnd_under = WindowFromPoint(pt);
-                    let slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
+                    let _slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
                     let wv = HWND(get_webview_hwnd() as *mut core::ffi::c_void);
 
-                    if (hwnd_under == slv || hwnd_under == wv) && !wv.is_invalid() {
-                        
-                        let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
-                        let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
-                        let is_click_event = is_down || is_up || msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK;
+                    if !wv.is_invalid() {
+                        let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN;
+                        let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP;
+                        let mut state = HOOK_STATE.load(Ordering::SeqCst);
 
+                        // 1. GESTION DE LA MACHINE À ÉTATS (Fix du "carré invisible")
                         if is_down {
                             if is_mouse_over_desktop_icon(pt.x, pt.y) {
-                                IS_NATIVE_DRAG.store(true, Ordering::SeqCst);
-                                IS_WEB_DRAG.store(false, Ordering::SeqCst);
-                                return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                                state = STATE_NATIVE;
                             } else {
-                                IS_NATIVE_DRAG.store(false, Ordering::SeqCst);
-                                IS_WEB_DRAG.store(true, Ordering::SeqCst);
+                                state = STATE_WEB;
                             }
-                        } else if IS_NATIVE_DRAG.load(Ordering::SeqCst) {
-                            if is_up { IS_NATIVE_DRAG.store(false, Ordering::SeqCst); }
+                            HOOK_STATE.store(state, Ordering::SeqCst);
+                        }
+
+                        // 2. LOGIQUE DE FILTRAGE
+                        if state == STATE_NATIVE {
+                            // On laisse Windows gérer totalement les icônes
+                            if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
-                        } else if IS_WEB_DRAG.load(Ordering::SeqCst) {
-                            if is_up { IS_WEB_DRAG.store(false, Ordering::SeqCst); }
-                        } else {
+                        }
+
+                        // Si on bouge sans cliquer, on vérifie si on survole une icône
+                        if state == STATE_IDLE && msg == WM_MOUSEMOVE {
                             if is_mouse_over_desktop_icon(pt.x, pt.y) {
                                 return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             }
                         }
-                        
+
+                        // 3. TUNNEL D'ENTRÉE WEB (Fix du hover et des clics multiples)
                         let mut client_pt = pt;
                         let _ = ScreenToClient(wv, &mut client_pt);
                         
-                        // CORRECTION 1 : Formatage mathématique robuste des coordonnées
-                        let lparam_fw = ((client_pt.y as u16 as isize) << 16) | (client_pt.x as u16 as isize);
+                        // Packing des coordonnées parfait (X en bas, Y en haut)
+                        let lp = ((client_pt.y as u16 as isize) << 16) | (client_pt.x as u16 as isize);
+                        let mut wp: usize = 0;
+                        if is_down || state == STATE_WEB { wp = 0x0001; } // MK_LBUTTON
+                        if msg == WM_MOUSEWHEEL { wp = (info.mouseData >> 16) as usize; }
 
-                        let mut fw_wparam: usize = 0;
-                        match msg {
-                            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK => fw_wparam = 0x0001,
-                            WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK => fw_wparam = 0x0002,
-                            WM_MOUSEMOVE => {
-                                // CORRECTION 2 : Si on drag un élément sur le web, on maintient la pression du clic
-                                if IS_WEB_DRAG.load(Ordering::SeqCst) {
-                                    fw_wparam = 0x0001; 
-                                }
+                        // Scanner profond pour trouver le moteur Chromium
+                        struct S { res: HWND }
+                        let mut s = S { res: HWND::default() };
+                        unsafe extern "system" fn cb(h: HWND, l: LPARAM) -> BOOL {
+                            let mut n = [0u16; 256];
+                            let len = GetClassNameW(h, &mut n);
+                            let class = String::from_utf16_lossy(&n[..len as usize]);
+                            if class.starts_with("Chrome_RenderWidgetHostHWND") {
+                                (*(l.0 as *mut S)).res = h;
+                                return BOOL(0);
                             }
-                            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => fw_wparam = (info.mouseData & 0xFFFF_0000) as usize,
-                            _ => {}
+                            BOOL(1)
                         }
+                        let _ = EnumChildWindows(wv, Some(cb), LPARAM(&mut s as *mut _ as isize));
+                        let target = if !s.res.is_invalid() { s.res } else { wv };
 
-                        // CORRECTION 3 : Le Scanner Profond.
-                        // On ignore le nom des dossiers parents et on fouille jusqu'à trouver le moteur Chromium.
-                        struct SearchData { result: HWND }
-                        let mut search = SearchData { result: HWND::default() };
-                        unsafe extern "system" fn enum_cb(h: HWND, l: LPARAM) -> BOOL {
-                            let mut class_name = [0u16; 256];
-                            let len = GetClassNameW(h, &mut class_name);
-                            if len > 0 {
-                                let name = String::from_utf16_lossy(&class_name[..len as usize]);
-                                if name.starts_with("Chrome_RenderWidgetHostHWND") {
-                                    let d = &mut *(l.0 as *mut SearchData);
-                                    d.result = h;
-                                    return BOOL(0); // Moteur trouvé, on arrête !
-                                }
-                            }
-                            BOOL(1) // Continuer de fouiller
-                        }
-                        let _ = EnumChildWindows(wv, Some(enum_cb), LPARAM(&mut search as *mut SearchData as isize));
-                        let target_hwnd = if !search.result.is_invalid() { search.result } else { wv };
+                        // ENVOI NATIF UNIQUE (On ne fait plus d'eval JS ici !)
+                        let _ = PostMessageW(target, msg, WPARAM(wp), LPARAM(lp));
 
-                        // On envoie le mouvement et les clics au bon moteur
-                        let _ = PostMessageW(target_hwnd, msg, WPARAM(fw_wparam), LPARAM(lparam_fw));
+                        if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
 
-                        // PONT JAVASCRIPT : Bypass d'occlusion et gestion DPI
-                        if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_MOUSEMOVE {
-                            if let Some(app) = APP_HANDLE.get() {
-                                use tauri::Manager;
-                                if let Some(window) = app.get_webview_window("main") {
-                                    let event_type = match msg {
-                                        WM_LBUTTONDOWN => "mousedown",
-                                        WM_LBUTTONUP => "mouseup",
-                                        _ => "mousemove",
-                                    };
-                                    
-                                    let js = format!(
-                                        "(function(physX, physY) {{
-                                            var scale = window.devicePixelRatio || 1;
-                                            var x = physX / scale;
-                                            var y = physY / scale;
-                                            var el = document.elementFromPoint(x, y);
-                                            if(el) {{
-                                                el.dispatchEvent(new MouseEvent('{}', {{bubbles: true, clientX: x, clientY: y}}));
-                                                if('{}' === 'mouseup') el.dispatchEvent(new MouseEvent('click', {{bubbles: true, clientX: x, clientY: y}}));
-                                            }}
-                                        }})({}, {});",
-                                        event_type, event_type, client_pt.x, client_pt.y
-                                    );
-                                    let _ = window.eval(&js);
-                                }
-                            }
-                        }
-
-                        if is_click_event {
+                        // On bloque l'événement pour Windows s'il est destiné au Web (évite le carré bleu)
+                        // mais on laisse passer le MOUSEMOVE pour ne pas figer le curseur de l'OS.
+                        if msg != WM_MOUSEMOVE {
                             return LRESULT(1);
-                        } else {
-                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
                     }
                 }
@@ -398,13 +355,11 @@ pub mod mouse_hook {
             }
 
             unsafe {
-                if let Ok(_h) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), windows::Win32::Foundation::HINSTANCE::default(), 0) {
-                    log::info!("Global mouse hook installed (Scanner profond actif)");
-                    let mut msg = MSG::default();
-                    while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
-                        let _ = TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
+                let _h = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0);
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
                 }
             }
         });
