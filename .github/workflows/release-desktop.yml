@@ -135,11 +135,25 @@ jobs:
           includeUpdaterJson: false
           args: ${{ matrix.args }} ${{ inputs.mode == 'dev' && '--features devtools' || '' }}
 
+      - name: Collect artifacts
+        id: collect
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          find src-tauri/target -type f \( \
+            -name "*.dmg" -o -name "*.exe" -o -name "*.msi" \
+            -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \
+            -o -name "*.msi.sig" -o -name "*.msi.zip" -o -name "*.msi.zip.sig" \
+            -o -name "*.exe.sig" -o -name "*.nsis.zip" -o -name "*.nsis.zip.sig" \
+          \) -exec cp {} artifacts/ \;
+          echo "=== Collected ==="
+          ls -la artifacts/
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ steps.tauri.outputs.artifactPaths }}
+          path: artifacts/*
           if-no-files-found: error
 
   publish-release:
