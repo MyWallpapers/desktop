@@ -133,12 +133,24 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifacts
-          find src-tauri/target -type f \( \
+          find src-tauri/target -path "*/bundle/*" -type f \( \
             -name "*.dmg" -o -name "*.exe" -o -name "*.msi" \
             -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \
             -o -name "*.msi.sig" -o -name "*.msi.zip" -o -name "*.msi.zip.sig" \
             -o -name "*.exe.sig" -o -name "*.nsis.zip" -o -name "*.nsis.zip.sig" \
           \) -exec cp {} artifacts/ \;
+
+          # Rename macOS .app.tar.gz to include arch (both builds produce identical filenames)
+          if [ "${{ matrix.artifact }}" = "macos-aarch64" ]; then
+            for f in artifacts/MyWallpaper.app.tar.gz*; do
+              [ -f "$f" ] && mv "$f" "${f/MyWallpaper.app/MyWallpaper_aarch64.app}"
+            done
+          elif [ "${{ matrix.artifact }}" = "macos-x64" ]; then
+            for f in artifacts/MyWallpaper.app.tar.gz*; do
+              [ -f "$f" ] && mv "$f" "${f/MyWallpaper.app/MyWallpaper_x64.app}"
+            done
+          fi
+
           echo "=== Collected ==="
           ls -la artifacts/
 
