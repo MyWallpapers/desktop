@@ -248,6 +248,9 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
     apply_injection(our_hwnd, &detection);
 
+    // Discover Chrome_RenderWidgetHostHWND (Chromium creates it after first navigation)
+    mouse_hook::start_chrome_widget_discovery(our_hwnd);
+
     if detection.is_24h2 {
         info!("Moteur Windows 11 24H2 activé.");
     } else {
@@ -288,6 +291,10 @@ pub fn try_refresh_desktop() -> bool {
             // Ré-injecter dans la nouvelle hiérarchie
             apply_injection(our_hwnd, &detection);
 
+            // Re-discover Chrome_RenderWidgetHostHWND (may have changed after Explorer restart)
+            mouse_hook::set_chrome_widget_hwnd(0);
+            mouse_hook::start_chrome_widget_discovery(our_hwnd);
+
             if detection.is_24h2 {
                 info!("Desktop recovered (24H2).");
             } else {
@@ -308,7 +315,7 @@ pub fn try_refresh_desktop() -> bool {
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU8, Ordering};
     use std::sync::OnceLock;
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -323,7 +330,15 @@ pub mod mouse_hook {
     static TARGET_PARENT_HWND: AtomicIsize = AtomicIsize::new(0);
     static EXPLORER_PID: AtomicU32 = AtomicU32::new(0);
 
-    /// AppHandle pour émettre des événements Tauri (scroll via JS au lieu de PostMessage)
+    /// Chrome_RenderWidgetHostHWND — Chromium's internal input HWND inside WebView2.
+    /// PostMessage to this HWND goes through Chromium's native input pipeline,
+    /// enabling CSS :hover, scroll, click, drag without any JS adaptation.
+    static CHROME_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0);
+
+    /// MK_* flag of the button that initiated the current drag (used for WM_MOUSEMOVE wparam)
+    static DRAG_BUTTON_MK: AtomicU16 = AtomicU16::new(0);
+
+    /// AppHandle for visibility watchdog events (wallpaper-visibility)
     static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
     static HOOK_STATE: AtomicU8 = AtomicU8::new(0);
@@ -334,8 +349,6 @@ pub mod mouse_hook {
     /// Tracks whether cursor was over desktop on previous move (for WM_MOUSELEAVE)
     static WAS_OVER_DESKTOP: AtomicBool = AtomicBool::new(false);
 
-    /// Debug: sampled move counter for diagnostic logging
-    static MOVE_DEBUG_COUNTER: AtomicU32 = AtomicU32::new(0);
     /// Debug: log first unknown window encounter
     static UNKNOWN_HWND_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -354,6 +367,52 @@ pub mod mouse_hook {
     pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
     pub fn set_app_handle(handle: tauri::AppHandle) { let _ = APP_HANDLE.set(handle); }
+    fn get_chrome_widget_hwnd() -> isize { CHROME_WIDGET_HWND.load(Ordering::SeqCst) }
+    fn set_chrome_widget_hwnd(hwnd: isize) { CHROME_WIDGET_HWND.store(hwnd, Ordering::SeqCst); }
+
+    /// Finds Chrome_RenderWidgetHostHWND inside the WebView2 HWND hierarchy.
+    /// This is Chromium's internal input HWND — PostMessage to it goes through
+    /// the native input pipeline (CSS :hover, scroll, click, drag all work).
+    pub fn discover_chrome_widget(webview_hwnd: HWND) -> Option<HWND> {
+        struct SearchData { found: HWND }
+        let mut data = SearchData { found: HWND::default() };
+
+        unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let mut cn = [0u16; 64];
+            let len = GetClassNameW(hwnd, &mut cn);
+            let class = String::from_utf16_lossy(&cn[..len as usize]);
+            if class == "Chrome_RenderWidgetHostHWND" {
+                let d = &mut *(lparam.0 as *mut SearchData);
+                d.found = hwnd;
+                return BOOL(0); // Stop enumeration
+            }
+            BOOL(1) // Continue
+        }
+
+        unsafe {
+            let _ = EnumChildWindows(webview_hwnd, Some(enum_cb), LPARAM(&mut data as *mut SearchData as isize));
+        }
+
+        if data.found.is_invalid() { None } else { Some(data.found) }
+    }
+
+    /// Spawns a background thread that polls for Chrome_RenderWidgetHostHWND.
+    /// Chrome creates this HWND after the first navigation, so we retry for up to 3 seconds.
+    pub fn start_chrome_widget_discovery(webview_hwnd: HWND) {
+        let wv_raw = webview_hwnd.0 as isize;
+        std::thread::spawn(move || {
+            let wv = HWND(wv_raw as *mut core::ffi::c_void);
+            for _ in 0..60 { // 60 × 50ms = 3 seconds
+                if let Some(cw) = discover_chrome_widget(wv) {
+                    set_chrome_widget_hwnd(cw.0 as isize);
+                    log::info!("Chrome_RenderWidgetHostHWND discovered: 0x{:X}", cw.0 as isize);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            log::warn!("Chrome_RenderWidgetHostHWND not found after 3s — PostMessage forwarding disabled until re-discovery.");
+        });
+    }
 
     /// Vérifie que tous les HWNDs desktop sont encore valides (détecte un redémarrage d'Explorer)
     pub fn validate_handles() -> bool {
@@ -465,39 +524,16 @@ pub mod mouse_hook {
                             }
                         }
 
-                        // Diagnostic logging (sampled: 1/500 moves, all wheel events)
-                        if msg == WM_MOUSEMOVE {
-                            let count = MOVE_DEBUG_COUNTER.fetch_add(1, Ordering::Relaxed);
-                            if count % 500 == 0 {
-                                let mut cn = [0u16; 256];
-                                let len = GetClassNameW(hwnd_under, &mut cn);
-                                let class = String::from_utf16_lossy(&cn[..len as usize]);
-                                log::info!("[MOUSE] move #{} hwnd=0x{:X} class='{}' over_desktop={} slv=0x{:X} wv=0x{:X} sv=0x{:X} tp=0x{:X}",
-                                    count, hwnd_under.0 as isize, class, is_over_desktop,
-                                    slv.0 as isize, wv.0 as isize, sv.0 as isize, tp.0 as isize);
-                            }
-                        } else if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                            let mut cn = [0u16; 256];
-                            let len = GetClassNameW(hwnd_under, &mut cn);
-                            let class = String::from_utf16_lossy(&cn[..len as usize]);
-                            log::info!("[MOUSE] wheel hwnd=0x{:X} class='{}' over_desktop={} delta={}",
-                                hwnd_under.0 as isize, class, is_over_desktop,
-                                (info.mouseData >> 16) as i16);
-                        }
-
                         let mut state = HOOK_STATE.load(Ordering::SeqCst);
 
                         // Si la souris n'est PAS sur notre fond d'écran, on LAISSE PASSER LE CLIC AUX AUTRES FENÊTRES
                         if state == STATE_IDLE && !is_over_desktop {
-                            // Transition desktop → hors-desktop : envoyer WM_MOUSELEAVE pour reset les :hover CSS
+                            // Transition desktop → hors-desktop : envoyer WM_MOUSELEAVE to reset CSS :hover
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
-                                if let Some(handle) = APP_HANDLE.get() {
-                                    use tauri::Emitter;
-                                    let _ = handle.emit("desktop-mouse", serde_json::json!({
-                                        "type": "mouseleave",
-                                        "x": pt.x, "y": pt.y,
-                                        "button": -1,
-                                    }));
+                                let cw_raw = get_chrome_widget_hwnd();
+                                if cw_raw != 0 {
+                                    let cw = HWND(cw_raw as *mut core::ffi::c_void);
+                                    let _ = PostMessageW(cw, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
                                 }
                             }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
@@ -526,69 +562,66 @@ pub mod mouse_hook {
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
-                        // 2. EMIT TAURI EVENT — All desktop mouse interactions go through JS
-                        //    PostMessage to Chrome_RenderWidgetHostHWND had coordinate mapping issues.
-                        //    Tauri event → JS document.elementFromPoint() → synthetic DOM event.
-                        //
-                        //    IMPORTANT: WM_MOUSEMOVE is NOT consumed (cursor stays visible) and
-                        //    is throttled to ~60fps to avoid IPC flood. Clicks/wheel ARE consumed.
-                        if let Some(handle) = APP_HANDLE.get() {
-                            use tauri::Emitter;
+                        // 2. POSTMESSAGE TO CHROME — Forward Win32 messages to Chromium's
+                        //    internal input HWND. This goes through Chromium's native input
+                        //    pipeline: CSS :hover, scroll, click, drag, focus all work natively.
+                        //    No JS adaptation needed (approach used by Lively Wallpaper).
+                        let cw_raw = get_chrome_widget_hwnd();
 
-                            let should_emit = if msg == WM_MOUSEMOVE {
-                                // Throttle mousemove to ~60fps (16ms)
-                                use std::time::{SystemTime, UNIX_EPOCH};
-                                static LAST_MOVE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                                let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-                                let prev = LAST_MOVE_MS.load(Ordering::Relaxed);
-                                if now_ms.wrapping_sub(prev) >= 16 {
-                                    LAST_MOVE_MS.store(now_ms, Ordering::Relaxed);
-                                    true
-                                } else {
-                                    false
-                                }
+                        // Lazy re-discovery: if Chrome widget not found yet, try once
+                        // (EnumChildWindows with 2-3 children takes <1ms, safe in hook)
+                        let cw_raw = if cw_raw == 0 {
+                            if let Some(found) = discover_chrome_widget(wv) {
+                                set_chrome_widget_hwnd(found.0 as isize);
+                                log::info!("Chrome_RenderWidgetHostHWND lazy-discovered: 0x{:X}", found.0 as isize);
+                                found.0 as isize
                             } else {
-                                true // Always emit clicks, wheel, etc.
-                            };
+                                0
+                            }
+                        } else {
+                            cw_raw
+                        };
 
-                            if should_emit {
-                                // Diagnostic logging
-                                static EMIT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                                let n = EMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-                                if n == 0 || n % 500 == 0 {
-                                    log::info!("[EMIT] desktop-mouse #{} msg=0x{:X} pt=({},{}) state={}", n, msg, pt.x, pt.y, state);
-                                }
+                        if cw_raw != 0 {
+                            let cw = HWND(cw_raw as *mut core::ffi::c_void);
+                            let lparam_pt = LPARAM(((pt.y as u32 & 0xFFFF) << 16 | (pt.x as u32 & 0xFFFF)) as isize);
 
-                                match msg {
-                                    WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                                        let delta = (info.mouseData >> 16) as i16;
-                                        let horizontal = msg == WM_MOUSEHWHEEL;
-                                        let _ = handle.emit("desktop-mouse", serde_json::json!({
-                                            "type": "wheel",
-                                            "x": pt.x, "y": pt.y,
-                                            "button": -1,
-                                            "deltaX": if horizontal { delta as i32 } else { 0 },
-                                            "deltaY": if horizontal { 0 } else { -(delta as i32) },
-                                        }));
-                                    }
-                                    _ => {
-                                        let (event_type, btn) = match msg {
-                                            WM_MOUSEMOVE => ("mousemove", -1i32),
-                                            WM_LBUTTONDOWN => ("mousedown", 0),
-                                            WM_LBUTTONUP => ("mouseup", 0),
-                                            WM_RBUTTONDOWN => ("mousedown", 2),
-                                            WM_RBUTTONUP => ("mouseup", 2),
-                                            WM_MBUTTONDOWN => ("mousedown", 1),
-                                            WM_MBUTTONUP => ("mouseup", 1),
-                                            _ => ("unknown", -1),
-                                        };
-                                        let _ = handle.emit("desktop-mouse", serde_json::json!({
-                                            "type": event_type,
-                                            "x": pt.x, "y": pt.y,
-                                            "button": btn,
-                                        }));
-                                    }
+                            match msg {
+                                WM_MOUSEMOVE => {
+                                    // During drag, include MK_* flag so Chromium tracks the drag
+                                    let mk = DRAG_BUTTON_MK.load(Ordering::Relaxed) as usize;
+                                    let _ = PostMessageW(cw, WM_MOUSEMOVE, WPARAM(mk), lparam_pt);
                                 }
+                                WM_LBUTTONDOWN => {
+                                    DRAG_BUTTON_MK.store(MK_LBUTTON.0 as u16, Ordering::Relaxed);
+                                    let _ = PostMessageW(cw, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON.0 as usize), lparam_pt);
+                                }
+                                WM_LBUTTONUP => {
+                                    DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
+                                    let _ = PostMessageW(cw, WM_LBUTTONUP, WPARAM(0), lparam_pt);
+                                }
+                                WM_RBUTTONDOWN => {
+                                    DRAG_BUTTON_MK.store(MK_RBUTTON.0 as u16, Ordering::Relaxed);
+                                    let _ = PostMessageW(cw, WM_RBUTTONDOWN, WPARAM(MK_RBUTTON.0 as usize), lparam_pt);
+                                }
+                                WM_RBUTTONUP => {
+                                    DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
+                                    let _ = PostMessageW(cw, WM_RBUTTONUP, WPARAM(0), lparam_pt);
+                                }
+                                WM_MBUTTONDOWN => {
+                                    DRAG_BUTTON_MK.store(MK_MBUTTON.0 as u16, Ordering::Relaxed);
+                                    let _ = PostMessageW(cw, WM_MBUTTONDOWN, WPARAM(MK_MBUTTON.0 as usize), lparam_pt);
+                                }
+                                WM_MBUTTONUP => {
+                                    DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
+                                    let _ = PostMessageW(cw, WM_MBUTTONUP, WPARAM(0), lparam_pt);
+                                }
+                                WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                                    // Wheel: wparam high word = delta, lparam = screen coords
+                                    let delta = info.mouseData & 0xFFFF0000; // high word already positioned
+                                    let _ = PostMessageW(cw, msg, WPARAM(delta as usize), lparam_pt);
+                                }
+                                _ => {}
                             }
                         }
 
