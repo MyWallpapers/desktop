@@ -529,53 +529,76 @@ pub mod mouse_hook {
                         // 2. EMIT TAURI EVENT — All desktop mouse interactions go through JS
                         //    PostMessage to Chrome_RenderWidgetHostHWND had coordinate mapping issues.
                         //    Tauri event → JS document.elementFromPoint() → synthetic DOM event.
+                        //
+                        //    IMPORTANT: WM_MOUSEMOVE is NOT consumed (cursor stays visible) and
+                        //    is throttled to ~60fps to avoid IPC flood. Clicks/wheel ARE consumed.
                         if let Some(handle) = APP_HANDLE.get() {
                             use tauri::Emitter;
 
-                            // Log first event + periodic for diagnostics
-                            static EMIT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                            let n = EMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-                            if n == 0 || n % 500 == 0 {
-                                log::info!("[EMIT] desktop-mouse #{} msg=0x{:X} pt=({},{}) state={}", n, msg, pt.x, pt.y, state);
-                            }
-
-                            match msg {
-                                WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                                    let delta = (info.mouseData >> 16) as i16;
-                                    let horizontal = msg == WM_MOUSEHWHEEL;
-                                    let _ = handle.emit("desktop-mouse", serde_json::json!({
-                                        "type": "wheel",
-                                        "x": pt.x, "y": pt.y,
-                                        "button": -1,
-                                        "deltaX": if horizontal { delta as i32 } else { 0 },
-                                        "deltaY": if horizontal { 0 } else { -(delta as i32) },
-                                    }));
+                            let should_emit = if msg == WM_MOUSEMOVE {
+                                // Throttle mousemove to ~60fps (16ms) using GetTickCount64
+                                static LAST_MOVE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                let now_ms = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+                                let prev = LAST_MOVE_MS.load(Ordering::Relaxed);
+                                if now_ms.wrapping_sub(prev) >= 16 {
+                                    LAST_MOVE_MS.store(now_ms, Ordering::Relaxed);
+                                    true
+                                } else {
+                                    false
                                 }
-                                _ => {
-                                    let (event_type, btn) = match msg {
-                                        WM_MOUSEMOVE => ("mousemove", -1i32),
-                                        WM_LBUTTONDOWN => ("mousedown", 0),
-                                        WM_LBUTTONUP => ("mouseup", 0),
-                                        WM_RBUTTONDOWN => ("mousedown", 2),
-                                        WM_RBUTTONUP => ("mouseup", 2),
-                                        WM_MBUTTONDOWN => ("mousedown", 1),
-                                        WM_MBUTTONUP => ("mouseup", 1),
-                                        _ => ("unknown", -1),
-                                    };
-                                    let _ = handle.emit("desktop-mouse", serde_json::json!({
-                                        "type": event_type,
-                                        "x": pt.x, "y": pt.y,
-                                        "button": btn,
-                                    }));
+                            } else {
+                                true // Always emit clicks, wheel, etc.
+                            };
+
+                            if should_emit {
+                                // Diagnostic logging
+                                static EMIT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                let n = EMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                if n == 0 || n % 500 == 0 {
+                                    log::info!("[EMIT] desktop-mouse #{} msg=0x{:X} pt=({},{}) state={}", n, msg, pt.x, pt.y, state);
+                                }
+
+                                match msg {
+                                    WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                                        let delta = (info.mouseData >> 16) as i16;
+                                        let horizontal = msg == WM_MOUSEHWHEEL;
+                                        let _ = handle.emit("desktop-mouse", serde_json::json!({
+                                            "type": "wheel",
+                                            "x": pt.x, "y": pt.y,
+                                            "button": -1,
+                                            "deltaX": if horizontal { delta as i32 } else { 0 },
+                                            "deltaY": if horizontal { 0 } else { -(delta as i32) },
+                                        }));
+                                    }
+                                    _ => {
+                                        let (event_type, btn) = match msg {
+                                            WM_MOUSEMOVE => ("mousemove", -1i32),
+                                            WM_LBUTTONDOWN => ("mousedown", 0),
+                                            WM_LBUTTONUP => ("mouseup", 0),
+                                            WM_RBUTTONDOWN => ("mousedown", 2),
+                                            WM_RBUTTONUP => ("mouseup", 2),
+                                            WM_MBUTTONDOWN => ("mousedown", 1),
+                                            WM_MBUTTONUP => ("mouseup", 1),
+                                            _ => ("unknown", -1),
+                                        };
+                                        let _ = handle.emit("desktop-mouse", serde_json::json!({
+                                            "type": event_type,
+                                            "x": pt.x, "y": pt.y,
+                                            "button": btn,
+                                        }));
+                                    }
                                 }
                             }
                         }
 
                         if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
 
-                        // CONSUMER le message pour empêcher Windows de le livrer à l'overlay.
-                        // Sans ça, Chrome reçoit WM_MOUSELEAVE (via TrackMouseEvent) → hover impossible.
-                        return LRESULT(1);
+                        // Only consume clicks and wheel — let WM_MOUSEMOVE pass through
+                        // so Windows keeps updating the cursor position (visibility + shape).
+                        if msg != WM_MOUSEMOVE {
+                            return LRESULT(1);
+                        }
+                        return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                     }
                 }
                 CallNextHookEx(HHOOK::default(), code, wparam, lparam)
