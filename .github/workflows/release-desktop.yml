@@ -122,21 +122,14 @@ jobs:
           echo "CARGO_PROFILE_RELEASE_INCREMENTAL=true" >> $GITHUB_ENV
           echo "CARGO_INCREMENTAL=1" >> $GITHUB_ENV
 
-      # Build only — no release management. Artifacts uploaded separately.
       - name: Build
-        uses: tauri-apps/tauri-action@v0.5
-        id: tauri
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          includeRelease: false
-          includeUpdaterJson: false
-          args: ${{ matrix.args }} ${{ inputs.mode == 'dev' && '--features devtools' || '' }}
+        run: npx tauri build ${{ matrix.args }} ${{ inputs.mode == 'dev' && '--features devtools' || '' }}
 
       - name: Collect artifacts
-        id: collect
         shell: bash
         run: |
           mkdir -p artifacts
