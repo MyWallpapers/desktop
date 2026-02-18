@@ -342,7 +342,7 @@ pub mod visibility_watchdog {
             use std::time::Duration;
             use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GetDesktopWindow};
             use windows::Win32::Graphics::Gdi::{MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
-            use windows::Win32::Foundation::RECT;
+            use windows::Win32::Foundation::{HWND, RECT};
 
             let mut was_visible = true;
 
