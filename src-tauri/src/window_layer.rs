@@ -584,42 +584,50 @@ pub mod mouse_hook {
 
                         if cw_raw != 0 {
                             let cw = HWND(cw_raw as *mut core::ffi::c_void);
-                            let lparam_pt = LPARAM(((pt.y as u32 & 0xFFFF) << 16 | (pt.x as u32 & 0xFFFF)) as isize);
+
+                            // Convert screen coords → client coords for Chrome_RenderWidgetHostHWND.
+                            // WM_MOUSEMOVE/LBUTTON*/etc. expect client-relative coordinates.
+                            // WM_MOUSEWHEEL is the exception — it uses screen coords.
+                            use windows::Win32::Graphics::Gdi::ScreenToClient;
+                            let mut client_pt = pt;
+                            let _ = ScreenToClient(cw, &mut client_pt);
+                            let lparam_client = LPARAM(((client_pt.y as u16 as u32) << 16 | (client_pt.x as u16 as u32)) as isize);
+                            let lparam_screen = LPARAM(((pt.y as u16 as u32) << 16 | (pt.x as u16 as u32)) as isize);
 
                             match msg {
                                 WM_MOUSEMOVE => {
                                     // During drag, include MK_* flag so Chromium tracks the drag
                                     let mk = DRAG_BUTTON_MK.load(Ordering::Relaxed) as usize;
-                                    let _ = PostMessageW(cw, WM_MOUSEMOVE, WPARAM(mk), lparam_pt);
+                                    let _ = PostMessageW(cw, WM_MOUSEMOVE, WPARAM(mk), lparam_client);
                                 }
                                 WM_LBUTTONDOWN => {
                                     DRAG_BUTTON_MK.store(MK_LBUTTON.0 as u16, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON.0 as usize), lparam_pt);
+                                    let _ = PostMessageW(cw, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON.0 as usize), lparam_client);
                                 }
                                 WM_LBUTTONUP => {
                                     DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_LBUTTONUP, WPARAM(0), lparam_pt);
+                                    let _ = PostMessageW(cw, WM_LBUTTONUP, WPARAM(0), lparam_client);
                                 }
                                 WM_RBUTTONDOWN => {
                                     DRAG_BUTTON_MK.store(MK_RBUTTON.0 as u16, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_RBUTTONDOWN, WPARAM(MK_RBUTTON.0 as usize), lparam_pt);
+                                    let _ = PostMessageW(cw, WM_RBUTTONDOWN, WPARAM(MK_RBUTTON.0 as usize), lparam_client);
                                 }
                                 WM_RBUTTONUP => {
                                     DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_RBUTTONUP, WPARAM(0), lparam_pt);
+                                    let _ = PostMessageW(cw, WM_RBUTTONUP, WPARAM(0), lparam_client);
                                 }
                                 WM_MBUTTONDOWN => {
                                     DRAG_BUTTON_MK.store(MK_MBUTTON.0 as u16, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_MBUTTONDOWN, WPARAM(MK_MBUTTON.0 as usize), lparam_pt);
+                                    let _ = PostMessageW(cw, WM_MBUTTONDOWN, WPARAM(MK_MBUTTON.0 as usize), lparam_client);
                                 }
                                 WM_MBUTTONUP => {
                                     DRAG_BUTTON_MK.store(0, Ordering::Relaxed);
-                                    let _ = PostMessageW(cw, WM_MBUTTONUP, WPARAM(0), lparam_pt);
+                                    let _ = PostMessageW(cw, WM_MBUTTONUP, WPARAM(0), lparam_client);
                                 }
                                 WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                                    // Wheel: wparam high word = delta, lparam = screen coords
+                                    // Wheel: wparam high word = delta, lparam = SCREEN coords (Win32 convention)
                                     let delta = info.mouseData & 0xFFFF0000; // high word already positioned
-                                    let _ = PostMessageW(cw, msg, WPARAM(delta as usize), lparam_pt);
+                                    let _ = PostMessageW(cw, msg, WPARAM(delta as usize), lparam_screen);
                                 }
                                 _ => {}
                             }
