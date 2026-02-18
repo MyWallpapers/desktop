@@ -308,7 +308,7 @@ pub fn try_refresh_desktop() -> bool {
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -330,6 +330,9 @@ pub mod mouse_hook {
 
     /// Tracks whether cursor was over desktop on previous move (for WM_MOUSELEAVE)
     static WAS_OVER_DESKTOP: AtomicBool = AtomicBool::new(false);
+
+    /// Debug: sampled move counter for diagnostic logging
+    static MOVE_DEBUG_COUNTER: AtomicU32 = AtomicU32::new(0);
 
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
@@ -414,6 +417,26 @@ pub mod mouse_hook {
                             || hwnd_under == tp    // Progman (24H2) ou WorkerW (Legacy)
                             || IsChild(wv, hwnd_under).as_bool()   // Chrome_RenderWidgetHostHWND etc.
                             || IsChild(tp, hwnd_under).as_bool();  // Tout enfant du parent desktop
+
+                        // Diagnostic logging (sampled: 1/500 moves, all wheel events)
+                        if msg == WM_MOUSEMOVE {
+                            let count = MOVE_DEBUG_COUNTER.fetch_add(1, Ordering::Relaxed);
+                            if count % 500 == 0 {
+                                let mut cn = [0u16; 256];
+                                let len = GetClassNameW(hwnd_under, &mut cn);
+                                let class = String::from_utf16_lossy(&cn[..len as usize]);
+                                log::info!("[MOUSE] move #{} hwnd=0x{:X} class='{}' over_desktop={} slv=0x{:X} wv=0x{:X} sv=0x{:X} tp=0x{:X}",
+                                    count, hwnd_under.0 as isize, class, is_over_desktop,
+                                    slv.0 as isize, wv.0 as isize, sv.0 as isize, tp.0 as isize);
+                            }
+                        } else if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
+                            let mut cn = [0u16; 256];
+                            let len = GetClassNameW(hwnd_under, &mut cn);
+                            let class = String::from_utf16_lossy(&cn[..len as usize]);
+                            log::info!("[MOUSE] wheel hwnd=0x{:X} class='{}' over_desktop={} delta={}",
+                                hwnd_under.0 as isize, class, is_over_desktop,
+                                (info.mouseData >> 16) as i16);
+                        }
 
                         let mut state = HOOK_STATE.load(Ordering::SeqCst);
 
