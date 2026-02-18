@@ -341,6 +341,12 @@ pub mod mouse_hook {
     /// MK_* flag of the button that initiated the current drag (used for WM_MOUSEMOVE wparam)
     static DRAG_BUTTON_MK: AtomicU16 = AtomicU16::new(0);
 
+    /// Original WndProc of Chrome_RenderWidgetHostHWND (for subclass chain)
+    static ORIGINAL_CHROME_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+    /// When true, the next WM_MOUSELEAVE is from our hook (let it through).
+    /// When false, WM_MOUSELEAVE is spurious from TrackMouseEvent (suppress it).
+    static EXPLICIT_MOUSELEAVE: AtomicBool = AtomicBool::new(false);
+
     /// AppHandle for visibility watchdog events (wallpaper-visibility)
     static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
@@ -399,6 +405,43 @@ pub mod mouse_hook {
         if data.found.is_invalid() { None } else { Some(data.found) }
     }
 
+    /// Subclass proc for Chrome_RenderWidgetHostHWND.
+    /// Suppresses spurious WM_MOUSELEAVE from Windows TrackMouseEvent.
+    ///
+    /// Problem: After each WM_MOUSEMOVE we PostMessage, Chromium calls
+    /// TrackMouseEvent(TME_LEAVE). Windows checks the REAL cursor position —
+    /// it's over SHELLDLL_DefView (not Chrome), so Windows immediately posts
+    /// WM_MOUSELEAVE. This kills CSS :hover and scroll.
+    ///
+    /// Fix: Block WM_MOUSELEAVE unless our hook explicitly sent it
+    /// (via EXPLICIT_MOUSELEAVE flag when cursor leaves desktop area).
+    unsafe extern "system" fn chrome_subclass_proc(
+        hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_MOUSELEAVE {
+            if EXPLICIT_MOUSELEAVE.swap(false, Ordering::Relaxed) {
+                // Our hook sent this — let it through to Chromium
+            } else {
+                // Spurious from TrackMouseEvent — suppress
+                return LRESULT(0);
+            }
+        }
+        let orig: WNDPROC = std::mem::transmute(ORIGINAL_CHROME_WNDPROC.load(Ordering::SeqCst));
+        CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+    }
+
+    /// Installs our subclass on Chrome_RenderWidgetHostHWND to suppress
+    /// spurious WM_MOUSELEAVE messages.
+    unsafe fn install_chrome_subclass(cw: HWND) {
+        let orig = SetWindowLongPtrW(cw, WINDOW_LONG_PTR_INDEX(-4), chrome_subclass_proc as isize);
+        if orig != 0 {
+            ORIGINAL_CHROME_WNDPROC.store(orig, Ordering::SeqCst);
+            log::info!("Chrome_RenderWidgetHostHWND subclassed (suppress spurious WM_MOUSELEAVE)");
+        } else {
+            log::warn!("Failed to subclass Chrome_RenderWidgetHostHWND — hover may not work");
+        }
+    }
+
     /// Spawns a background thread that polls for Chrome_RenderWidgetHostHWND.
     /// Chrome creates this HWND after the first navigation, so we retry for up to 3 seconds.
     pub fn start_chrome_widget_discovery(webview_hwnd: HWND) {
@@ -409,6 +452,7 @@ pub mod mouse_hook {
                 if let Some(cw) = discover_chrome_widget(wv) {
                     set_chrome_widget_hwnd(cw.0 as isize);
                     log::info!("Chrome_RenderWidgetHostHWND discovered: 0x{:X}", cw.0 as isize);
+                    unsafe { install_chrome_subclass(cw); }
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -536,6 +580,8 @@ pub mod mouse_hook {
                                 let cw_raw = get_chrome_widget_hwnd();
                                 if cw_raw != 0 {
                                     let cw = HWND(cw_raw as *mut core::ffi::c_void);
+                                    // Set flag so our subclass lets this WM_MOUSELEAVE through
+                                    EXPLICIT_MOUSELEAVE.store(true, Ordering::Relaxed);
                                     let _ = PostMessageW(cw, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
                                 }
                             }
