@@ -226,7 +226,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
     use std::sync::atomic::{AtomicIsize, Ordering};
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -240,7 +240,6 @@ pub mod mouse_hook {
 
     unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
         use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
-        // Correction Windows 0.58: VARIANT est dans windows::core
         use windows::core::VARIANT;
 
         let pt = windows::Win32::Foundation::POINT { x, y };
@@ -249,9 +248,7 @@ pub mod mouse_hook {
 
         if AccessibleObjectFromPoint(pt, &mut p_acc, &mut var_child).is_ok() {
             if let Some(acc) = p_acc {
-                // Correction Windows 0.58: get_accRole prend 1 seul paramètre et retourne Result<VARIANT>
                 if let Ok(role_var) = acc.get_accRole(&var_child) {
-                    // Méthode sûre via TryFrom (nécessite windows 0.58+)
                     if let Ok(role_val) = i32::try_from(&role_var) {
                         if role_val == 34 { return true; } // 34 = ROLE_SYSTEM_LISTITEM
                     }
@@ -272,20 +269,30 @@ pub mod mouse_hook {
                 if code >= 0 {
                     let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
                     let pt = info.pt;
+                    let msg = wparam.0 as u32;
 
                     let hwnd_under = WindowFromPoint(pt);
                     let slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
                     let wv = HWND(get_webview_hwnd() as *mut core::ffi::c_void);
 
-                    if hwnd_under == slv && !wv.is_invalid() {
+                    // --- NOUVEAUX LOGS CHIRURGICAUX ---
+                    // On ne loggue que les clics gauche ou droit pour analyser ce que Windows voit
+                    if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN {
+                        log::info!(
+                            "[MOUSE HOOK] Clic détecté en ({}, {}). Fenêtre touchée: {:?}, Bureau attendu: {:?}, Webview: {:?}", 
+                            pt.x, pt.y, hwnd_under, slv, wv
+                        );
+                    }
+
+                    // On s'assure que le clic est sur le bureau (slv) ou directement sur notre app (wv)
+                    if (hwnd_under == slv || hwnd_under == wv) && !wv.is_invalid() {
+                        
                         if is_mouse_over_desktop_icon(pt.x, pt.y) {
+                            if msg == WM_LBUTTONDOWN { log::info!("[MOUSE HOOK] Clic ignoré (Icône survolée)"); }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
-                        let msg = wparam.0 as u32;
                         let mut client_pt = pt;
-                        
-                        // On calcule les coordonnées par rapport à la fenêtre principale
                         let _ = ScreenToClient(wv, &mut client_pt);
                         let lparam_fw = ((client_pt.y as isize) << 16) | (client_pt.x as isize & 0xFFFF);
 
@@ -294,20 +301,41 @@ pub mod mouse_hook {
                             fw_wparam = (info.mouseData & 0xFFFF_0000) as usize;
                         }
 
-                        // --- CORRECTION INTERACTIVITÉ WEBVIEW2 ---
-                        // On cherche la vraie sous-fenêtre Chromium qui gère la page Web
+                        // --- SCANNER PROFOND CHROMIUM ---
+                        // Au lieu de deviner l'architecture, on fouille toutes les sous-fenêtres
                         let mut target_hwnd = wv;
-                        let cw0 = FindWindowExW(wv, HWND::default(), windows::core::w!("Chrome_WidgetWin_0"), None).unwrap_or(HWND::default());
-                        if !cw0.is_invalid() {
-                            let crw = FindWindowExW(cw0, HWND::default(), windows::core::w!("Chrome_RenderWidgetHostHWND"), None).unwrap_or(HWND::default());
-                            if !crw.is_invalid() {
-                                target_hwnd = crw; // C'est LUI qui doit recevoir le clic !
+                        struct SearchData { result: HWND }
+                        let mut search = SearchData { result: HWND::default() };
+                        
+                        unsafe extern "system" fn enum_cb(h: HWND, l: LPARAM) -> BOOL {
+                            let mut class_name = [0u16; 256];
+                            let len = GetClassNameW(h, &mut class_name);
+                            if len > 0 {
+                                let name = String::from_utf16_lossy(&class_name[..len as usize]);
+                                if name == "Chrome_RenderWidgetHostHWND" {
+                                    let d = &mut *(l.0 as *mut SearchData);
+                                    d.result = h;
+                                    return BOOL(0); // Trouvé ! On arrête la recherche.
+                                }
                             }
+                            BOOL(1)
+                        }
+                        
+                        let _ = EnumChildWindows(wv, Some(enum_cb), LPARAM(&mut search as *mut _ as isize));
+                        if !search.result.is_invalid() {
+                            target_hwnd = search.result;
+                        } else if msg == WM_LBUTTONDOWN {
+                            log::warn!("[MOUSE HOOK] Attention: Chrome_RenderWidgetHostHWND introuvable, utilisation de la coquille vide.");
                         }
 
-                        // On envoie le clic au moteur Web
+                        if msg == WM_LBUTTONDOWN { 
+                            log::info!("[MOUSE HOOK] Clic transféré au moteur Web (HWND: {:?}) aux coordonnées relatives ({}, {})", target_hwnd, client_pt.x, client_pt.y); 
+                        }
+
                         let _ = PostMessageW(target_hwnd, msg, WPARAM(fw_wparam), LPARAM(lparam_fw));
                         return LRESULT(1);
+                    } else if msg == WM_LBUTTONDOWN {
+                        log::debug!("[MOUSE HOOK] Clic hors zone (pas sur le bureau ni l'app). Ignoré.");
                     }
                 }
                 CallNextHookEx(HHOOK::default(), code, wparam, lparam)
