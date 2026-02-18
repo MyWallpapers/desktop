@@ -12,7 +12,15 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": "v1Compatible",
-    "targets": ["msi", "nsis", "deb", "rpm", "appimage", "dmg", "app"],
+    "targets": [
+      "msi",
+      "nsis",
+      "deb",
+      "rpm",
+      "appimage",
+      "dmg",
+      "app"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -29,7 +37,10 @@
     },
     "linux": {
       "deb": {
-        "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"]
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libayatana-appindicator3-1"
+        ]
       }
     }
   },
@@ -53,7 +64,8 @@
         "closable": true,
         "focus": false,
         "visible": false,
-        "devtools": true
+        "devtools": true,
+        "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows"
       }
     ],
     "trayIcon": {
@@ -65,7 +77,9 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["mywallpaper"]
+        "schemes": [
+          "mywallpaper"
+        ]
       }
     },
     "updater": {

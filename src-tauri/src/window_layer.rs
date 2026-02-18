@@ -108,7 +108,6 @@ pub fn restore_desktop_icons() {
 
 #[cfg(target_os = "windows")]
 fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use tauri::Manager;
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -220,8 +219,6 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         }
     }
 
-    // ON DONNE L'APP AU HOOK ICI
-    mouse_hook::set_app_handle(window.app_handle().clone());
     mouse_hook::start_hook_thread();
     Ok(())
 }
@@ -236,14 +233,12 @@ pub mod mouse_hook {
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
-    static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
     static IS_NATIVE_DRAG: AtomicBool = AtomicBool::new(false);
     static IS_WEB_DRAG: AtomicBool = AtomicBool::new(false);
 
     pub fn set_webview_hwnd(hwnd: isize) { WEBVIEW_HWND.store(hwnd, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(hwnd: isize) { SYSLISTVIEW_HWND.store(hwnd, Ordering::SeqCst); }
-    pub fn set_app_handle(app: tauri::AppHandle) { let _ = APP_HANDLE.set(app); }
     
     pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
@@ -353,35 +348,6 @@ pub mod mouse_hook {
 
                         // On envoie le mouvement et les clics au bon moteur
                         let _ = PostMessageW(target_hwnd, msg, WPARAM(fw_wparam), LPARAM(lparam_fw));
-
-                        // CORRECTION 4 : Le contournement DPI en Javascript
-                        if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP {
-                            if let Some(app) = APP_HANDLE.get() {
-                                use tauri::Manager;
-                                if let Some(window) = app.get_webview_window("main") {
-                                    let event_type = if msg == WM_LBUTTONDOWN { "mousedown" } else { "mouseup" };
-                                    let click_trigger = if msg == WM_LBUTTONUP { 
-                                        "el.dispatchEvent(new MouseEvent('click', {bubbles: true, clientX: x, clientY: y}));" 
-                                    } else { "" };
-
-                                    // On divise les coordonnées par "devicePixelRatio" pour s'adapter à l'échelle de l'écran Windows !
-                                    let js = format!(
-                                        "(function(physX, physY) {{
-                                            var scale = window.devicePixelRatio || 1;
-                                            var x = physX / scale;
-                                            var y = physY / scale;
-                                            var el = document.elementFromPoint(x, y);
-                                            if(el) {{
-                                                el.dispatchEvent(new MouseEvent('{}', {{bubbles: true, clientX: x, clientY: y}}));
-                                                {}
-                                            }}
-                                        }})({}, {});",
-                                        event_type, click_trigger, client_pt.x, client_pt.y
-                                    );
-                                    let _ = window.eval(&js);
-                                }
-                            }
-                        }
 
                         if is_click_event {
                             return LRESULT(1);
