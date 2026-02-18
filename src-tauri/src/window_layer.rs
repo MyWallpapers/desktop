@@ -5,11 +5,7 @@
 //!          Native icons (ROLE_SYSTEM_LISTITEM) are ignored and process clicks natively.
 //! macOS: kCGDesktopWindowLevel set behind desktop icons. Native icon hiding via Finder defaults.
 
-use log::{info as _info, warn as _warn};
-# [cfg(target_os = "windows")]
-use log::{info, warn};
-# [cfg(target_os = "macos")]
-use log::{info, warn};
+use log::{info, warn, error, debug};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // Flag de sécurité pour ne pas spammer le système à la fermeture
@@ -19,14 +15,14 @@ static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
 // Setup Dispatch
 // ============================================================================
 
-pub fn setup_desktop_window(_window: &tauri::WebviewWindow) {
+pub fn setup_desktop_window(window: &tauri::WebviewWindow) {
     #[cfg(target_os = "windows")]
     if let Err(e) = ensure_in_worker_w(window) {
         warn!("Failed to setup Windows desktop layer: {}", e);
     }
 
     #[cfg(target_os = "macos")]
-    if let Err(e) = setup_macos_desktop(_window) {
+    if let Err(e) = setup_macos_desktop(window) {
         warn!("Failed to setup macOS desktop layer: {}", e);
     }
 }
@@ -454,24 +450,19 @@ pub mod visibility_watchdog {
 
 #[cfg(target_os = "macos")]
 fn setup_macos_desktop(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use tauri::Manager; // On importe Manager uniquement pour macOS (évite le warning sur Windows)
+    use tauri::Manager;
 
-    // Dans Tauri 2, on passe par RawWindowHandle pour une compatibilité parfaite ARM64/x86_64
-    use tauri::window::RawWindowHandle;
-    let handle = window.window_handle().map_err(|e| e.to_string())?;
+    // Dans Tauri 2, on récupère le pointeur NSWindow directement de manière sécurisée
+    let ns_window = window.ns_window().map_err(|e| e.to_string())? as *mut objc::runtime::Object;
     
-    if let RawWindowHandle::AppKit(handle) = handle.as_raw() {
-        let ns_window = handle.ns_window.as_ptr() as *mut objc::runtime::Object;
-        
-        use objc::{msg_send, sel, sel_impl};
-        unsafe {
-            // Utilisation de types explicites pour éviter les erreurs d'ABI sur ARM64
-            let _: () = msg_send![ns_window, setLevel: -2147483623_isize];
-            let _: () = msg_send![ns_window, setCollectionBehavior: 81_usize];
-            let _: () = msg_send![ns_window, setIgnoresMouseEvents: true];
-        }
-    } else {
-        return Err("Not an AppKit window".to_string());
+    use objc::{msg_send, sel, sel_impl};
+    unsafe {
+        // kCGDesktopWindowLevel = -2147483623
+        let _: () = msg_send![ns_window, setLevel: -2147483623_isize];
+        // CanJoinAllSpaces | Stationary | IgnoresCycle = 81
+        let _: () = msg_send![ns_window, setCollectionBehavior: 81_usize];
+        // Désactive les interactions directes pour laisser passer les clics au bureau si besoin
+        let _: () = msg_send![ns_window, setIgnoresMouseEvents: true];
     }
 
     macos_hook::start_hook_thread(window.app_handle().clone());
