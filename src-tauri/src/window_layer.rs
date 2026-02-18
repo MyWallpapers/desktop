@@ -5,6 +5,10 @@
 //!          Native icons (ROLE_SYSTEM_LISTITEM) are ignored and process clicks natively.
 //! macOS: kCGDesktopWindowLevel set behind desktop icons. Native icon hiding via Finder defaults.
 
+use log::{info as _info, warn as _warn};
+# [cfg(target_os = "windows")]
+use log::{info, warn};
+# [cfg(target_os = "macos")]
 use log::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,14 +19,14 @@ static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
 // Setup Dispatch
 // ============================================================================
 
-pub fn setup_desktop_window(window: &tauri::WebviewWindow) {
+pub fn setup_desktop_window(_window: &tauri::WebviewWindow) {
     #[cfg(target_os = "windows")]
     if let Err(e) = ensure_in_worker_w(window) {
         warn!("Failed to setup Windows desktop layer: {}", e);
     }
 
     #[cfg(target_os = "macos")]
-    if let Err(e) = setup_macos_desktop(window) {
+    if let Err(e) = setup_macos_desktop(_window) {
         warn!("Failed to setup macOS desktop layer: {}", e);
     }
 }
@@ -33,7 +37,7 @@ pub fn setup_desktop_window(window: &tauri::WebviewWindow) {
 
 /// Commande Tauri appelée depuis le Frontend (JS/TS) pour masquer les icônes
 #[tauri::command]
-pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
+pub fn set_desktop_icons_visible(_visible: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
@@ -43,9 +47,9 @@ pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
         if slv_hwnd != 0 {
             let slv = HWND(slv_hwnd as *mut core::ffi::c_void);
             unsafe {
-                let _ = ShowWindow(slv, if visible { SW_SHOW } else { SW_HIDE });
+                let _ = ShowWindow(slv, if _visible { SW_SHOW } else { SW_HIDE });
             }
-            info!("Windows: Desktop icons visibility set to {}", visible);
+            info!("Windows: Desktop icons visibility set to {}", _visible);
         } else {
             warn!("Cannot toggle icons: SysListView32 not found yet.");
         }
@@ -54,14 +58,14 @@ pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         // Sur macOS, on désactive l'affichage du bureau via le Finder
-        let val = if visible { "true" } else { "false" };
+        let val = if _visible { "true" } else { "false" };
         let _ = std::process::Command::new("defaults")
             .args(["write", "com.apple.finder", "CreateDesktop", val])
             .output();
         let _ = std::process::Command::new("killall")
             .arg("Finder")
             .output();
-        info!("macOS: Desktop icons visibility set to {}", visible);
+        info!("macOS: Desktop icons visibility set to {}", _visible);
     }
 
     Ok(())
@@ -497,15 +501,22 @@ pub mod visibility_watchdog {
 fn setup_macos_desktop(window: &tauri::WebviewWindow) -> Result<(), String> {
     use tauri::Manager; // On importe Manager uniquement pour macOS (évite le warning sur Windows)
 
-    let ns_window = window.ns_window().map_err(|e| format!("Failed to get NSWindow: {}", e))? as *mut std::ffi::c_void;
-
-    use objc::{msg_send, sel, sel_impl};
-    unsafe {
-        let obj = ns_window as *mut objc::runtime::Object;
+    // Dans Tauri 2, on passe par RawWindowHandle pour une compatibilité parfaite ARM64/x86_64
+    use tauri::window::RawWindowHandle;
+    let handle = window.window_handle().map_err(|e| e.to_string())?;
+    
+    if let RawWindowHandle::AppKit(handle) = handle.as_raw() {
+        let ns_window = handle.ns_window.as_ptr() as *mut objc::runtime::Object;
         
-        let _: () = msg_send![obj, setLevel: -2147483623_i64];
-        let _: () = msg_send![obj, setCollectionBehavior: 81_u64];
-        let _: () = msg_send![obj, setIgnoresMouseEvents: true];
+        use objc::{msg_send, sel, sel_impl};
+        unsafe {
+            // Utilisation de types explicites pour éviter les erreurs d'ABI sur ARM64
+            let _: () = msg_send![ns_window, setLevel: -2147483623_isize];
+            let _: () = msg_send![ns_window, setCollectionBehavior: 81_usize];
+            let _: () = msg_send![ns_window, setIgnoresMouseEvents: true];
+        }
+    } else {
+        return Err("Not an AppKit window".to_string());
     }
 
     macos_hook::start_hook_thread(window.app_handle().clone());
