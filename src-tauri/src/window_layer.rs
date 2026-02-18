@@ -229,6 +229,7 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 
 #[cfg(target_os = "windows")]
 fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use tauri::Manager;
     use windows::Win32::Foundation::HWND;
 
     let our_hwnd = window.hwnd().map_err(|e| format!("Failed to get HWND: {}", e))?;
@@ -243,6 +244,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     if !detection.syslistview.is_invalid() {
         mouse_hook::set_syslistview_hwnd(detection.syslistview.0 as isize);
     }
+    mouse_hook::set_app_handle(window.app_handle().clone());
 
     apply_injection(our_hwnd, &detection);
 
@@ -309,6 +311,7 @@ pub fn try_refresh_desktop() -> bool {
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
+    use std::sync::OnceLock;
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -317,12 +320,19 @@ pub mod mouse_hook {
     // WM_MOUSELEAVE n'est pas dans WindowsAndMessaging — défini manuellement
     const WM_MOUSELEAVE: u32 = 0x02A3;
 
+    // Classe UTF-16 pour comparaison rapide sans allocation
+    const PROGMAN_U16: [u16; 7] = [80, 114, 111, 103, 109, 97, 110]; // "Progman"
+    const WORKERW_U16: [u16; 7] = [87, 111, 114, 107, 101, 114, 87]; // "WorkerW"
+
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SHELL_VIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static TARGET_PARENT_HWND: AtomicIsize = AtomicIsize::new(0);
     static RENDER_WIDGET_HWND: AtomicIsize = AtomicIsize::new(0);
     static EXPLORER_PID: AtomicU32 = AtomicU32::new(0);
+
+    /// AppHandle pour émettre des événements Tauri (scroll via JS au lieu de PostMessage)
+    static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
     static HOOK_STATE: AtomicU8 = AtomicU8::new(0);
     const STATE_IDLE: u8 = 0;
@@ -351,6 +361,7 @@ pub mod mouse_hook {
     }
     pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
+    pub fn set_app_handle(handle: tauri::AppHandle) { let _ = APP_HANDLE.set(handle); }
 
     /// Invalide le cache de Chrome_RenderWidgetHostHWND (après recovery)
     pub fn invalidate_render_cache() {
@@ -431,13 +442,12 @@ pub mod mouse_hook {
 
                         // Détection d'overlay système (Win11 Widgets/Copilot/Search)
                         // Ces fenêtres sont transparentes visuellement mais bloquent WindowFromPoint.
-                        // On les identifie par : styles d'overlay + process différent d'Explorer
-                        // + la fenêtre n'est PAS au premier plan (exclut les vraies apps)
                         if !is_over_desktop {
                             let root = GetAncestor(hwnd_under, GA_ROOT);
                             let fg = GetForegroundWindow();
 
-                            // Si la fenêtre (ou sa racine) est au premier plan, c'est une vraie app
+                            // A) Si la fenêtre est au premier plan → c'est une vraie app, pas d'override
+                            // B) Sinon, vérifier les styles d'overlay + PID non-Explorer
                             if root != fg && hwnd_under != fg && !root.is_invalid() {
                                 let ex = GetWindowLongW(root, GWL_EXSTYLE) as u32;
                                 let is_overlay_style = (ex & WS_EX_NOACTIVATE.0) != 0
@@ -454,27 +464,16 @@ pub mod mouse_hook {
                                 }
                             }
 
-                            // Diagnostic : log détaillé du premier hwnd inconnu qui échappe à la détection
-                            if !is_over_desktop && !UNKNOWN_HWND_LOGGED.swap(true, Ordering::Relaxed) {
-                                let ex = if !root.is_invalid() { GetWindowLongW(root, GWL_EXSTYLE) as u32 } else { 0 };
-                                let mut overlay_pid = 0u32;
-                                if !root.is_invalid() { GetWindowThreadProcessId(root, Some(&mut overlay_pid)); }
-                                let explorer_pid = EXPLORER_PID.load(Ordering::Relaxed);
-                                let mut root_cn = [0u16; 256];
-                                let root_len = if !root.is_invalid() { GetClassNameW(root, &mut root_cn) } else { 0 };
-                                let root_class = String::from_utf16_lossy(&root_cn[..root_len as usize]);
-                                let mut cn = [0u16; 256];
-                                let cn_len = GetClassNameW(hwnd_under, &mut cn);
-                                let under_class = String::from_utf16_lossy(&cn[..cn_len as usize]);
-                                log::info!("[MOUSE] UNDETECTED hwnd=0x{:X} class='{}' root=0x{:X} root_class='{}' ex=0x{:X} noact={} tool={} layered={} appwin={} pid={} explorer_pid={} fg=0x{:X}",
-                                    hwnd_under.0 as isize, under_class,
-                                    root.0 as isize, root_class, ex,
-                                    (ex & WS_EX_NOACTIVATE.0) != 0,
-                                    (ex & WS_EX_TOOLWINDOW.0) != 0,
-                                    (ex & WS_EX_LAYERED.0) != 0,
-                                    (ex & WS_EX_APPWINDOW.0) != 0,
-                                    overlay_pid, explorer_pid,
-                                    fg.0 as isize);
+                            // C) Fallback Lively-style : si le foreground EST le bureau (Progman/WorkerW),
+                            // alors on est sur le desktop même si un overlay bloque WindowFromPoint
+                            if !is_over_desktop {
+                                let mut fg_cn = [0u16; 16];
+                                let fg_len = GetClassNameW(fg, &mut fg_cn) as usize;
+                                if fg.is_invalid()
+                                    || (fg_len == 7 && (fg_cn[..7] == PROGMAN_U16 || fg_cn[..7] == WORKERW_U16))
+                                {
+                                    is_over_desktop = true;
+                                }
                             }
                         }
 
@@ -562,16 +561,27 @@ pub mod mouse_hook {
                             }
                         }
 
-                        // 3. COORDONNÉES
-                        // WM_MOUSEWHEEL/MOUSEHWHEEL utilisent des coordonnées ÉCRAN dans LPARAM
-                        // Tous les autres messages (MOUSEMOVE, BUTTONDOWN, etc.) utilisent des coordonnées CLIENT
-                        let lp = if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                            (((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)) as isize
-                        } else {
-                            let mut client_pt = pt;
-                            let _ = ScreenToClient(target, &mut client_pt);
-                            (((client_pt.y as i32 & 0xFFFF) << 16) | (client_pt.x as i32 & 0xFFFF)) as isize
-                        };
+                        // 3. SCROLL → TAURI EVENT (PostMessage WM_MOUSEWHEEL ne fonctionne pas
+                        //    avec les browsers injectés — confirmé par recherche sur tous les projets OSS)
+                        if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
+                            if let Some(handle) = APP_HANDLE.get() {
+                                use tauri::Emitter;
+                                let delta = (info.mouseData >> 16) as i16;
+                                let horizontal = msg == WM_MOUSEHWHEEL;
+                                let _ = handle.emit("desktop-scroll", serde_json::json!({
+                                    "deltaX": if horizontal { delta as i32 } else { 0 },
+                                    "deltaY": if horizontal { 0 } else { -(delta as i32) },
+                                    "x": pt.x, "y": pt.y
+                                }));
+                            }
+                            if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
+                            return LRESULT(1);
+                        }
+
+                        // 4. AUTRES MESSAGES → PostMessage vers Chrome_RenderWidgetHostHWND
+                        let mut client_pt = pt;
+                        let _ = ScreenToClient(target, &mut client_pt);
+                        let lp = (((client_pt.y as i32 & 0xFFFF) << 16) | (client_pt.x as i32 & 0xFFFF)) as isize;
 
                         let mut wp: usize = 0;
                         if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || (msg == WM_MOUSEMOVE && state == STATE_WEB) {
@@ -583,15 +593,7 @@ pub mod mouse_hook {
                         if msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP {
                             wp |= 0x0010;
                         }
-                        if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                            wp = (info.mouseData & 0xFFFF0000) as usize;
-                        }
 
-                        // 4. INJECTION DIRECTE — toujours vers Chrome_RenderWidgetHostHWND
-                        if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                            log::info!("[MOUSE] wheel fwd → target=0x{:X} wp=0x{:X} lp=0x{:X}",
-                                target.0 as isize, wp, lp);
-                        }
                         let _ = PostMessageW(target, msg, WPARAM(wp), LPARAM(lp));
 
                         if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
