@@ -901,10 +901,11 @@ pub mod mouse_hook {
                         let state = HOOK_STATE.load(Ordering::Relaxed);
 
                         // ── Fast path: STATE_NATIVE ──
-                        // PostMessage ALL events to SysListView32 for complete icon interaction.
-                        // SetCapture is per-thread and doesn't route events cross-process,
-                        // so CallNextHookEx alone cannot deliver moves/mouseup to Explorer.
-                        // We must explicitly forward every event via PostMessage.
+                        // Dual delivery: PostMessage for guaranteed SysListView32 delivery
+                        // + CallNextHookEx so real events flow through the system.
+                        // LRESULT(1) would prevent the system from updating GetAsyncKeyState,
+                        // which breaks DragDetect()'s modal loop and SysListView32's drag detection.
+                        // Real hardware events must flow for OLE Drag & SetCapture to work.
                         if state == STATE_NATIVE {
                             if is_up {
                                 forward_to_syslistview(msg, pt);
@@ -912,12 +913,9 @@ pub mod mouse_hook {
                             } else if msg == WM_MOUSEMOVE {
                                 forward_to_syslistview(msg, pt);
                             } else if is_down {
-                                // Additional mousedown while in native mode (e.g. right-click during drag)
                                 forward_to_syslistview(msg, pt);
                             }
-                            // Consume the event — SysListView32 gets it via PostMessage.
-                            // CallNextHookEx would deliver to the WebView (wrong target).
-                            return LRESULT(1);
+                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
                         // ── Fast path: STATE_WEB — forward to WebView, skip desktop detection ──
@@ -994,9 +992,10 @@ pub mod mouse_hook {
                                     LAST_CLICK_Y.store(pt.y, Ordering::Relaxed);
                                 }
 
-                                // PostMessage the mousedown for guaranteed delivery
+                                // PostMessage for guaranteed delivery + CallNextHookEx
+                                // to let the system register button state (GetAsyncKeyState).
                                 forward_to_syslistview(msg, pt);
-                                return LRESULT(1);
+                                return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             }
                             OVER_ICON.store(false, Ordering::Relaxed);
                             set_webview_click_through(wv, false);
