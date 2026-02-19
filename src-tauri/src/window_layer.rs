@@ -645,6 +645,24 @@ pub mod mouse_hook {
     static OVER_ICON: AtomicBool = AtomicBool::new(false);
     /// Tick counter for throttled icon hover checks (every 8th MOUSE_MOVE)
     static ICON_CHECK_TICK: AtomicU32 = AtomicU32::new(0);
+    /// Tracks whether WS_EX_TRANSPARENT is currently set on the WebView
+    static WV_TRANSPARENT: AtomicBool = AtomicBool::new(false);
+
+    /// Toggle WS_EX_TRANSPARENT on the WebView to make it click-through.
+    /// When set, WindowFromPoint skips our window and clicks reach the icons behind.
+    /// WebView2 composition mode renders via DirectComposition which overlays HWND Z-order,
+    /// so the only way to let clicks through is to make the entire HWND transparent to hit-tests.
+    #[inline]
+    unsafe fn set_webview_click_through(wv: HWND, transparent: bool) {
+        let was = WV_TRANSPARENT.swap(transparent, Ordering::Relaxed);
+        if was == transparent { return; } // No change
+        let ex = GetWindowLongW(wv, GWL_EXSTYLE);
+        if transparent {
+            let _ = SetWindowLongW(wv, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT.0 as i32);
+        } else {
+            let _ = SetWindowLongW(wv, GWL_EXSTYLE, ex & !(WS_EX_TRANSPARENT.0 as i32));
+        }
+    }
 
     /// Check if hwnd_under is part of the desktop hierarchy, with caching.
     /// Only recomputes when the window under cursor changes.
@@ -804,6 +822,7 @@ pub mod mouse_hook {
 
                         if !is_over_desktop {
                             OVER_ICON.store(false, Ordering::Relaxed);
+                            set_webview_click_through(wv, false);
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
                                 send_input(MOUSE_LEAVE, VK_NONE, 0, 0, 0);
                             }
@@ -821,6 +840,9 @@ pub mod mouse_hook {
                                 HOVER_Y.store(pt.y, Ordering::Relaxed);
                                 NEEDS_ICON_CHECK.store(true, Ordering::Relaxed);
                             }
+                            // Sync click-through state with background thread's OVER_ICON
+                            let icon_flag = OVER_ICON.load(Ordering::Relaxed);
+                            set_webview_click_through(wv, icon_flag);
                         }
 
                         // State transition on mousedown — synchronous check required.
@@ -828,13 +850,15 @@ pub mod mouse_hook {
                         // space to icon between background polls (16ms window).
                         if is_down {
                             let over_icon = is_mouse_over_desktop_icon(pt.x, pt.y);
-                            log::info!("[hook] mousedown at ({},{}) hwnd=0x{:X} over_icon={}", pt.x, pt.y, hwnd_under.0 as isize, over_icon);
                             if over_icon {
                                 OVER_ICON.store(true, Ordering::Relaxed);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
+                                // Make WebView click-through so click reaches icons behind
+                                set_webview_click_through(wv, true);
                                 return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             }
                             OVER_ICON.store(false, Ordering::Relaxed);
+                            set_webview_click_through(wv, false);
                             HOOK_STATE.store(STATE_WEB, Ordering::Relaxed);
                             WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
                         }

@@ -2305,7 +2305,7 @@ dependencies = [
 
 [[package]]
 name = "mywallpaper-desktop"
-version = "1.0.114"
+version = "1.0.128"
 dependencies = [
  "log",
  "objc",
