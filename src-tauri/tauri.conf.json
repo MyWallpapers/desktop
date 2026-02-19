@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "MyWallpaper",
   "identifier": "com.mywallpaper.desktop",
-  "version": "1.0.125",
+  "version": "1.0.126",
   "build": {
     "beforeBuildCommand": "",
     "beforeDevCommand": "",
