@@ -232,16 +232,26 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 
         let _ = SetParent(our_hwnd, detection.target_parent);
 
-        // SWP_FRAMECHANGED forces DWM to recalculate the non-client area,
-        // eliminating the ~7-8px invisible border left over from the old styles.
+        // Get the exact size of the desktop (our new parent)
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        let _ = GetClientRect(detection.target_parent, &mut rect);
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+
+        // Position at (0,0) with parent's exact size — SWP_NOMOVE/SWP_NOSIZE removed
+        // so Windows uses our explicit coords instead of the stale pre-injection position
+        // (which included the invisible border offset).
+        // SWP_FRAMECHANGED forces DWM to recalculate the non-client area.
         if detection.is_24h2 {
-            let _ = SetWindowPos(our_hwnd, detection.shell_view, 0, 0, 0, 0,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
+            let _ = SetWindowPos(our_hwnd, detection.shell_view,
+                0, 0, width, height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
             let _ = SetWindowPos(detection.os_workerw, our_hwnd, 0, 0, 0, 0,
                 SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE);
         } else {
-            let _ = SetWindowPos(our_hwnd, HWND::default(), 0, 0, 0, 0,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
+            let _ = SetWindowPos(our_hwnd, HWND::default(),
+                0, 0, width, height,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
         }
     }
 }
@@ -664,6 +674,28 @@ pub mod mouse_hook {
         }
     }
 
+    /// Forward a mouse message directly to SysListView32 via PostMessageW.
+    /// This bypasses the HWND Z-order issue where WebView2's DirectComposition
+    /// visual intercepts clicks even with WS_EX_TRANSPARENT set.
+    #[inline]
+    unsafe fn forward_to_syslistview(msg: u32, pt: windows::Win32::Foundation::POINT) {
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+        let slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
+        if slv.is_invalid() { return; }
+        let mut client_pt = pt;
+        let _ = ScreenToClient(slv, &mut client_pt);
+        // Build wparam with current key state flags (MK_*)
+        let mut mk: u32 = 0;
+        if GetKeyState(0x01) < 0 { mk |= 0x0001; } // MK_LBUTTON
+        if GetKeyState(0x02) < 0 { mk |= 0x0002; } // MK_RBUTTON
+        if GetKeyState(0x10) < 0 { mk |= 0x0004; } // MK_SHIFT
+        if GetKeyState(0x11) < 0 { mk |= 0x0008; } // MK_CONTROL
+        if GetKeyState(0x04) < 0 { mk |= 0x0010; } // MK_MBUTTON
+        let lp = LPARAM(((client_pt.y as u32 & 0xFFFF) << 16 | (client_pt.x as u32 & 0xFFFF)) as isize);
+        let _ = PostMessageW(slv, msg, WPARAM(mk as usize), lp);
+    }
+
     /// Check if hwnd_under is part of the desktop hierarchy, with caching.
     /// Only recomputes when the window under cursor changes.
     #[inline]
@@ -798,10 +830,17 @@ pub mod mouse_hook {
                         let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
                         let state = HOOK_STATE.load(Ordering::Relaxed);
 
-                        // ── Fast path: STATE_NATIVE — pass to OS, zero processing ──
+                        // ── Fast path: STATE_NATIVE — forward to SysListView32 ──
+                        // We consume the event and PostMessage it directly to SysListView32
+                        // because CallNextHookEx delivers clicks to the WebView (on top in
+                        // DirectComposition Z-order), not to the icon window behind it.
                         if state == STATE_NATIVE {
-                            if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
-                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                            forward_to_syslistview(msg, pt);
+                            if is_up {
+                                HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
+                                set_webview_click_through(wv, false);
+                            }
+                            return LRESULT(1); // Consume — we forwarded directly
                         }
 
                         // ── Fast path: STATE_WEB — forward to WebView, skip desktop detection ──
@@ -853,9 +892,9 @@ pub mod mouse_hook {
                             if over_icon {
                                 OVER_ICON.store(true, Ordering::Relaxed);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
-                                // Make WebView click-through so click reaches icons behind
-                                set_webview_click_through(wv, true);
-                                return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                                // Forward click directly to SysListView32 via PostMessage
+                                forward_to_syslistview(msg, pt);
+                                return LRESULT(1); // Consume — forwarded directly
                             }
                             OVER_ICON.store(false, Ordering::Relaxed);
                             set_webview_click_through(wv, false);
@@ -863,8 +902,12 @@ pub mod mouse_hook {
                             WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
                         }
 
-                        // If hovering over a desktop icon, pass all events to OS
+                        // If hovering over a desktop icon, forward moves to SysListView32
+                        // so icons get hover/highlight effects, and consume the event.
                         if OVER_ICON.load(Ordering::Relaxed) {
+                            if msg == WM_MOUSEMOVE {
+                                forward_to_syslistview(msg, pt);
+                            }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
