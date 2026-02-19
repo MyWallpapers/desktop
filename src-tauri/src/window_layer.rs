@@ -232,27 +232,26 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 
         let _ = SetParent(our_hwnd, detection.target_parent);
 
-        // Get the exact size of the desktop (our new parent)
-        let mut rect = windows::Win32::Foundation::RECT::default();
-        let _ = GetClientRect(detection.target_parent, &mut rect);
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-
-        // Position at (0,0) with parent's exact size — SWP_NOMOVE/SWP_NOSIZE removed
-        // so Windows uses our explicit coords instead of the stale pre-injection position
-        // (which included the invisible border offset).
-        // SWP_FRAMECHANGED forces DWM to recalculate the non-client area.
+        // Step 1: Z-order placement only (SWP_NOMOVE|SWP_NOSIZE to not touch geometry)
         if detection.is_24h2 {
-            let _ = SetWindowPos(our_hwnd, detection.shell_view,
-                0, 0, width, height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+            let _ = SetWindowPos(our_hwnd, detection.shell_view, 0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
             let _ = SetWindowPos(detection.os_workerw, our_hwnd, 0, 0, 0, 0,
                 SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE);
         } else {
-            let _ = SetWindowPos(our_hwnd, HWND::default(),
-                0, 0, width, height,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+            let _ = SetWindowPos(our_hwnd, HWND::default(), 0, 0, 0, 0,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
         }
+
+        // Step 2: Position + size — separate call to avoid z-order interference.
+        // Use GetWindowRect on parent (screen coords, DPI-correct) for the true size.
+        // Position at (0,0) in parent-relative coords to eliminate invisible border offset.
+        let mut parent_rect = windows::Win32::Foundation::RECT::default();
+        let _ = GetWindowRect(detection.target_parent, &mut parent_rect);
+        let w = parent_rect.right - parent_rect.left;
+        let h = parent_rect.bottom - parent_rect.top;
+        let _ = SetWindowPos(our_hwnd, HWND::default(), 0, 0, w, h,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
 }
 
