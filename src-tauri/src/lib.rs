@@ -88,7 +88,7 @@ fn start_with_tauri_webview() {
 
             if let Some(window) = app.get_webview_window("main") {
                 use tauri::webview::Color;
-                let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+                let _ = window.set_background_color(Some(Color(0, 0, 0, 255)));
                 let _ = window.set_decorations(false);
 
                 if let Some(monitor) = window.primary_monitor().ok().flatten() {

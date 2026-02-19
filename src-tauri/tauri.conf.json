@@ -56,7 +56,7 @@
         "title": "MyWallpaper",
         "fullscreen": false,
         "decorations": false,
-        "transparent": true,
+        "transparent": false,
         "alwaysOnTop": false,
         "skipTaskbar": true,
         "resizable": false,
@@ -66,7 +66,7 @@
         "focus": false,
         "visible": false,
         "devtools": true,
-        "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows"
+        "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist"
       }
     ],
     "trayIcon": {
