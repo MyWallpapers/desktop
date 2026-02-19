@@ -532,6 +532,99 @@ pub mod mouse_hook {
         false
     }
 
+    // HWND cache — avoids recomputing is_over_desktop when cursor stays over the same window.
+    // Saves ~6 Win32 API calls per mouse event in the common case (cursor over a normal app).
+    static CACHED_HWND: AtomicIsize = AtomicIsize::new(0);
+    static CACHED_IS_DESKTOP: AtomicBool = AtomicBool::new(false);
+
+    /// Check if hwnd_under is part of the desktop hierarchy, with caching.
+    /// Only recomputes when the window under cursor changes.
+    #[inline]
+    unsafe fn check_is_over_desktop(hwnd_under: HWND, wv: HWND) -> bool {
+        let cached = CACHED_HWND.load(Ordering::Relaxed);
+        if hwnd_under.0 as isize == cached && cached != 0 {
+            return CACHED_IS_DESKTOP.load(Ordering::Relaxed);
+        }
+
+        let slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
+        let sv = HWND(SHELL_VIEW_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void);
+        let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void);
+
+        let mut result = hwnd_under == slv
+            || hwnd_under == wv
+            || hwnd_under == sv
+            || hwnd_under == tp
+            || IsChild(wv, hwnd_under).as_bool()
+            || IsChild(tp, hwnd_under).as_bool();
+
+        // Overlay detection for non-foreground transparent windows (Win11 Widgets/Copilot/Search)
+        if !result {
+            let fg = GetForegroundWindow();
+            if hwnd_under != fg {
+                let root = GetAncestor(hwnd_under, GA_ROOT);
+                if root != fg && !root.is_invalid() {
+                    let ex = GetWindowLongW(root, GWL_EXSTYLE) as u32;
+                    let is_overlay = (ex & WS_EX_NOACTIVATE.0) != 0
+                        || (ex & WS_EX_TOOLWINDOW.0) != 0
+                        || ((ex & WS_EX_LAYERED.0) != 0 && (ex & WS_EX_APPWINDOW.0) == 0);
+                    if is_overlay {
+                        let explorer_pid = EXPLORER_PID.load(Ordering::Relaxed);
+                        let mut overlay_pid = 0u32;
+                        GetWindowThreadProcessId(root, Some(&mut overlay_pid));
+                        if overlay_pid != explorer_pid && overlay_pid != 0 {
+                            result = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        CACHED_HWND.store(hwnd_under.0 as isize, Ordering::Relaxed);
+        CACHED_IS_DESKTOP.store(result, Ordering::Relaxed);
+        result
+    }
+
+    /// Forward a mouse event to the WebView via SendMouseInput dispatch.
+    #[inline]
+    unsafe fn forward_to_webview(msg: u32, info: &MSLLHOOKSTRUCT, client_pt: windows::Win32::Foundation::POINT) {
+        match msg {
+            WM_MOUSEMOVE => {
+                let vk = DRAG_VK.load(Ordering::Relaxed) as i32;
+                send_input(MOUSE_MOVE, vk, 0, client_pt.x, client_pt.y);
+            }
+            WM_LBUTTONDOWN => {
+                DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed);
+                send_input(MOUSE_LBUTTON_DOWN, VK_LBUTTON, 0, client_pt.x, client_pt.y);
+            }
+            WM_LBUTTONUP => {
+                DRAG_VK.store(0, Ordering::Relaxed);
+                send_input(MOUSE_LBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
+            }
+            WM_RBUTTONDOWN => {
+                DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed);
+                send_input(MOUSE_RBUTTON_DOWN, VK_RBUTTON, 0, client_pt.x, client_pt.y);
+            }
+            WM_RBUTTONUP => {
+                DRAG_VK.store(0, Ordering::Relaxed);
+                send_input(MOUSE_RBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
+            }
+            WM_MBUTTONDOWN => {
+                DRAG_VK.store(VK_MBUTTON as isize, Ordering::Relaxed);
+                send_input(MOUSE_MBUTTON_DOWN, VK_MBUTTON, 0, client_pt.x, client_pt.y);
+            }
+            WM_MBUTTONUP => {
+                DRAG_VK.store(0, Ordering::Relaxed);
+                send_input(MOUSE_MBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
+            }
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                let delta = (info.mouseData >> 16) as i16 as i32 as u32;
+                let kind = if msg == WM_MOUSEWHEEL { MOUSE_WHEEL } else { MOUSE_HWHEEL };
+                send_input(kind, VK_NONE, delta, client_pt.x, client_pt.y);
+            }
+            _ => {}
+        }
+    }
+
     pub fn start_hook_thread() {
         std::thread::spawn(|| {
             unsafe {
@@ -549,136 +642,61 @@ pub mod mouse_hook {
                     let wv_hwnd = get_webview_hwnd();
                     if wv_hwnd != 0 {
                         let wv = HWND(wv_hwnd as *mut core::ffi::c_void);
+                        let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
+                        let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
+                        let state = HOOK_STATE.load(Ordering::Relaxed);
 
-                        // On identifie la fenêtre sous le curseur et on vérifie si elle fait partie
-                        // de la hiérarchie desktop (Progman/WorkerW/SHELLDLL_DefView/SysListView32/WebView)
-                        let hwnd_under = WindowFromPoint(pt);
-                        let slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
-                        let sv = HWND(SHELL_VIEW_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void);
-                        let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void);
-
-                        let mut is_over_desktop = hwnd_under == slv
-                            || hwnd_under == wv
-                            || hwnd_under == sv    // SHELLDLL_DefView
-                            || hwnd_under == tp    // Progman (24H2) ou WorkerW (Legacy)
-                            || IsChild(wv, hwnd_under).as_bool()
-                            || IsChild(tp, hwnd_under).as_bool();  // Tout enfant du parent desktop
-
-                        // Fast path for non-desktop windows:
-                        // If cursor is on or inside the foreground window → real app, skip overlay check.
-                        // Only do expensive overlay detection for non-foreground transparent windows
-                        // (Win11 Widgets/Copilot/Search that steal WindowFromPoint).
-                        if !is_over_desktop {
-                            let fg = GetForegroundWindow();
-                            if hwnd_under != fg {
-                                let root = GetAncestor(hwnd_under, GA_ROOT);
-                                if root != fg && !root.is_invalid() {
-                                    let ex = GetWindowLongW(root, GWL_EXSTYLE) as u32;
-                                    let is_overlay_style = (ex & WS_EX_NOACTIVATE.0) != 0
-                                        || (ex & WS_EX_TOOLWINDOW.0) != 0
-                                        || ((ex & WS_EX_LAYERED.0) != 0 && (ex & WS_EX_APPWINDOW.0) == 0);
-                                    if is_overlay_style {
-                                        let explorer_pid = EXPLORER_PID.load(Ordering::Relaxed);
-                                        let mut overlay_pid = 0u32;
-                                        GetWindowThreadProcessId(root, Some(&mut overlay_pid));
-                                        if overlay_pid != explorer_pid && overlay_pid != 0 {
-                                            is_over_desktop = true;
-                                        }
-                                    }
-                                }
-                            }
+                        // ── Fast path: STATE_NATIVE — pass to OS, zero processing ──
+                        if state == STATE_NATIVE {
+                            if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
+                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
-                        let mut state = HOOK_STATE.load(Ordering::SeqCst);
+                        // ── Fast path: STATE_WEB — forward to WebView, skip desktop detection ──
+                        // During active click/drag, we always forward regardless of cursor position.
+                        if state == STATE_WEB {
+                            use windows::Win32::Graphics::Gdi::ScreenToClient;
+                            let mut client_pt = pt;
+                            let _ = ScreenToClient(wv, &mut client_pt);
+                            forward_to_webview(msg, &info, client_pt);
+                            if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
+                            if msg != WM_MOUSEMOVE { return LRESULT(1); }
+                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                        }
 
-                        // Si la souris n'est PAS sur notre fond d'écran, on LAISSE PASSER LE CLIC AUX AUTRES FENÊTRES
-                        if state == STATE_IDLE && !is_over_desktop {
-                            // Transition desktop → off-desktop: send MOUSE_LEAVE to reset CSS :hover
+                        // ── STATE_IDLE — desktop detection with HWND cache ──
+                        let hwnd_under = WindowFromPoint(pt);
+                        let is_over_desktop = check_is_over_desktop(hwnd_under, wv);
+
+                        if !is_over_desktop {
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
                                 send_input(MOUSE_LEAVE, VK_NONE, 0, pt.x, pt.y);
                             }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
-                        // Track la présence sur le desktop pour détecter la sortie
+                        // Cursor is over desktop in IDLE state
                         if msg == WM_MOUSEMOVE {
                             WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
                         }
 
-                        let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
-                        let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
-
-                        // 1. MACHINE À ÉTATS
-                        if is_down && state == STATE_IDLE {
+                        // State transition on mousedown
+                        if is_down {
                             if is_mouse_over_desktop_icon(pt.x, pt.y) {
-                                state = STATE_NATIVE;
-                            } else {
-                                state = STATE_WEB;
+                                HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
+                                return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             }
-                            HOOK_STATE.store(state, Ordering::SeqCst);
+                            HOOK_STATE.store(STATE_WEB, Ordering::Relaxed);
+                            WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
                         }
 
-                        if state == STATE_NATIVE {
-                            if is_up {
-                                HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst);
-                            }
-                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
-                        }
-
-                        // 2. SEND MOUSE INPUT — Forward events via CompositionController.
-                        //    SendMouseInput bypasses TrackMouseEvent entirely — CSS :hover,
-                        //    scroll, click, drag, focus all work natively. No JS adaptation needed.
-
-                        // Convert screen coords → client coords for WebView.
-                        // SendMouseInput expects coordinates relative to the WebView's top-left.
+                        // Forward to WebView (hover moves in IDLE + first click IDLE→WEB)
                         use windows::Win32::Graphics::Gdi::ScreenToClient;
                         let mut client_pt = pt;
                         let _ = ScreenToClient(wv, &mut client_pt);
+                        forward_to_webview(msg, &info, client_pt);
 
-                        match msg {
-                            WM_MOUSEMOVE => {
-                                let vk = DRAG_VK.load(Ordering::Relaxed) as i32;
-                                send_input(MOUSE_MOVE, vk, 0, client_pt.x, client_pt.y);
-                            }
-                            WM_LBUTTONDOWN => {
-                                DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed);
-                                send_input(MOUSE_LBUTTON_DOWN, VK_LBUTTON, 0, client_pt.x, client_pt.y);
-                            }
-                            WM_LBUTTONUP => {
-                                DRAG_VK.store(0, Ordering::Relaxed);
-                                send_input(MOUSE_LBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
-                            }
-                            WM_RBUTTONDOWN => {
-                                DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed);
-                                send_input(MOUSE_RBUTTON_DOWN, VK_RBUTTON, 0, client_pt.x, client_pt.y);
-                            }
-                            WM_RBUTTONUP => {
-                                DRAG_VK.store(0, Ordering::Relaxed);
-                                send_input(MOUSE_RBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
-                            }
-                            WM_MBUTTONDOWN => {
-                                DRAG_VK.store(VK_MBUTTON as isize, Ordering::Relaxed);
-                                send_input(MOUSE_MBUTTON_DOWN, VK_MBUTTON, 0, client_pt.x, client_pt.y);
-                            }
-                            WM_MBUTTONUP => {
-                                DRAG_VK.store(0, Ordering::Relaxed);
-                                send_input(MOUSE_MBUTTON_UP, VK_NONE, 0, client_pt.x, client_pt.y);
-                            }
-                            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                                let delta = (info.mouseData >> 16) as i16 as i32 as u32;
-                                let kind = if msg == WM_MOUSEWHEEL { MOUSE_WHEEL } else { MOUSE_HWHEEL };
-                                send_input(kind, VK_NONE, delta, client_pt.x, client_pt.y);
-                            }
-                            _ => {}
-                        }
-
-                        if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::SeqCst); }
-
-                        // Only consume clicks and wheel — let WM_MOUSEMOVE pass through
-                        // so Windows keeps updating the cursor position (visibility + shape).
-                        if msg != WM_MOUSEMOVE {
-                            return LRESULT(1);
-                        }
+                        if msg != WM_MOUSEMOVE { return LRESULT(1); }
                         return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                     }
                 }
@@ -706,79 +724,103 @@ pub mod visibility_watchdog {
 
     #[cfg(target_os = "windows")]
     pub fn start(app: AppHandle) {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use tauri::Emitter;
 
-        std::thread::spawn(move || {
-            use std::time::Duration;
-            use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GetDesktopWindow};
-            use windows::Win32::Graphics::Gdi::{MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
-            use windows::Win32::Foundation::{HWND, RECT};
+        static WATCHDOG_APP: OnceLock<AppHandle> = OnceLock::new();
+        static WAS_VISIBLE: AtomicBool = AtomicBool::new(true);
+        let _ = WATCHDOG_APP.set(app);
 
-            let mut was_visible = true;
+        std::thread::spawn(|| {
+            use windows::Win32::UI::Accessibility::*;
+            use windows::Win32::UI::WindowsAndMessaging::*;
+            use windows::Win32::Graphics::Gdi::*;
+            use windows::Win32::Foundation::*;
 
-            loop {
-                std::thread::sleep(Duration::from_secs(2));
+            /// Shared visibility check — called from event hooks and timer.
+            unsafe fn check_visibility() {
+                let wv_hwnd = super::mouse_hook::get_webview_hwnd();
+                if wv_hwnd == 0 { return; }
 
-                // Détection de stale HWNDs (redémarrage d'Explorer)
-                if !super::mouse_hook::validate_handles() {
-                    log::warn!("Desktop handles stale (Explorer restart?), attempting recovery...");
-                    if super::try_refresh_desktop() {
-                        log::info!("Desktop hierarchy recovered successfully.");
+                let fg = GetForegroundWindow();
+                let desk = GetDesktopWindow();
+
+                let is_visible = if fg == desk || fg.is_invalid() {
+                    true
+                } else {
+                    let hmon_fg = MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY);
+                    let hmon_wv = MonitorFromWindow(HWND(wv_hwnd as *mut _), MONITOR_DEFAULTTOPRIMARY);
+                    if hmon_fg != hmon_wv {
+                        true
                     } else {
-                        log::warn!("Desktop recovery failed — will retry next cycle.");
+                        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                        if GetMonitorInfoW(hmon_fg, &mut mi).as_bool() {
+                            let mut fg_rect = RECT::default();
+                            let _ = GetWindowRect(fg, &mut fg_rect);
+                            !(fg_rect.left <= mi.rcMonitor.left
+                                && fg_rect.top <= mi.rcMonitor.top
+                                && fg_rect.right >= mi.rcMonitor.right
+                                && fg_rect.bottom >= mi.rcMonitor.bottom)
+                        } else {
+                            true
+                        }
                     }
-                    continue; // Skip visibility check this cycle
+                };
+
+                let was = WAS_VISIBLE.swap(is_visible, Ordering::Relaxed);
+                if is_visible != was {
+                    if let Some(app) = WATCHDOG_APP.get() {
+                        let _ = app.emit("wallpaper-visibility", is_visible);
+                    }
                 }
+            }
 
-                unsafe {
-                    let fg_hwnd = GetForegroundWindow();
-                    let desk_hwnd = GetDesktopWindow();
+            /// Event callback for SetWinEventHook — fires on foreground changes, window moves, etc.
+            unsafe extern "system" fn on_event(
+                _hook: HWINEVENTHOOK, _event: u32, _hwnd: HWND,
+                _obj: i32, _child: i32, _thread: u32, _time: u32,
+            ) {
+                check_visibility();
+            }
 
-                    // Si on est sur le bureau, on est forcément visible
-                    if fg_hwnd == desk_hwnd || fg_hwnd.is_invalid() {
-                        if !was_visible {
-                            let _ = app.emit("wallpaper-visibility", true);
-                            was_visible = true;
+            unsafe {
+                // React to foreground window changes (Alt-Tab, click other app, Win+D)
+                let _h1 = SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                    None, Some(on_event), 0, 0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
+                // React to window move/resize end (maximize, fullscreen toggle)
+                let _h2 = SetWinEventHook(
+                    EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND,
+                    None, Some(on_event), 0, 0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
+                // React to minimize start/end (restore from taskbar)
+                let _h3 = SetWinEventHook(
+                    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
+                    None, Some(on_event), 0, 0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
+
+                // Fallback timer (10s) for Explorer restart detection
+                const TIMER_ID: usize = 1;
+                let _ = SetTimer(HWND::default(), TIMER_ID, 10_000, None);
+
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
+                    if msg.message == WM_TIMER && msg.wParam.0 == TIMER_ID {
+                        if !super::mouse_hook::validate_handles() {
+                            log::warn!("Desktop handles stale — attempting recovery...");
+                            if super::try_refresh_desktop() {
+                                log::info!("Desktop hierarchy recovered.");
+                            }
                         }
                         continue;
                     }
-
-                    // --- RAFFINEMENT MULTI-ÉCRANS ---
-                    // On récupère le moniteur de la fenêtre au premier plan
-                    let hmonitor_fg = MonitorFromWindow(fg_hwnd, MONITOR_DEFAULTTOPRIMARY);
-
-                    // On récupère le moniteur de notre fond d'écran (via son HWND stocké)
-                    let wv_hwnd = super::mouse_hook::get_webview_hwnd();
-                    if wv_hwnd == 0 { continue; }
-                    let hmonitor_wv = MonitorFromWindow(HWND(wv_hwnd as *mut _), MONITOR_DEFAULTTOPRIMARY);
-
-                    // Si la fenêtre au premier plan n'est pas sur le même écran que nous, on reste visible
-                    if hmonitor_fg != hmonitor_wv {
-                        if !was_visible {
-                            let _ = app.emit("wallpaper-visibility", true);
-                            was_visible = true;
-                        }
-                        continue;
-                    }
-
-                    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-                    if GetMonitorInfoW(hmonitor_fg, &mut mi).as_bool() {
-                        let mut fg_rect = RECT::default();
-                        let _ = GetWindowRect(fg_hwnd, &mut fg_rect);
-
-                        // On vérifie si la fenêtre remplit tout le moniteur (Plein écran / Jeu)
-                        let is_fullscreen = fg_rect.left <= mi.rcMonitor.left
-                            && fg_rect.top <= mi.rcMonitor.top
-                            && fg_rect.right >= mi.rcMonitor.right
-                            && fg_rect.bottom >= mi.rcMonitor.bottom;
-
-                        let is_visible = !is_fullscreen;
-
-                        if is_visible != was_visible {
-                            was_visible = is_visible;
-                            let _ = app.emit("wallpaper-visibility", is_visible);
-                        }
-                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
                 }
             }
         });
@@ -786,7 +828,7 @@ pub mod visibility_watchdog {
 
     #[cfg(not(target_os = "windows"))]
     pub fn start(_app: AppHandle) {
-        // macOS App Nap gère la pause nativement
+        // macOS App Nap handles pause natively
     }
 }
 
