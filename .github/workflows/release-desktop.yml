@@ -126,8 +126,9 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: bash
         run: |
-          cargo build --manifest-path hook-dll/Cargo.toml --release
+          cd hook-dll && cargo build --release && cd ..
           cp hook-dll/target/release/mouseleave_hook.dll src-tauri/
+          echo "=== Hook DLL ===" && ls -la src-tauri/mouseleave_hook.dll
 
       - name: Create dummy hook DLL (non-Windows)
         if: matrix.platform != 'windows-latest'
