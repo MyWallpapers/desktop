@@ -769,7 +769,15 @@ pub mod mouse_hook {
             _ => return,
         };
 
-        let _ = PostMessageW(slv, wm, wp, lparam);
+        let result = PostMessageW(slv, wm, wp, lparam);
+
+        // Diagnostic — log first 10 forwards, then every 200th
+        static FWD_COUNT: AtomicU32 = AtomicU32::new(0);
+        let n = FWD_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 10 || (n % 200 == 0 && wm != WM_MOUSEMOVE) {
+            log::info!("[forward] SLV=0x{:X} msg=0x{:X} screen=({},{}) client=({},{}) ok={}",
+                slv_raw, wm, info.pt.x, info.pt.y, client_pt.x, client_pt.y, result.is_ok());
+        }
     }
 
     /// Check if hwnd_under is part of the desktop hierarchy, with caching.
