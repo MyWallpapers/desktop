@@ -539,7 +539,10 @@ pub mod mouse_hook {
                 if let Ok(val) = i32::try_from(&hit) {
                     val > 0
                 } else {
-                    true // VT_DISPATCH = child accessible object = icon
+                    // Only VT_DISPATCH (=9) means a child accessible object (icon).
+                    // VT_EMPTY, VT_NULL, or any other type = not an icon.
+                    let vt = unsafe { hit.as_raw().Anonymous.Anonymous.vt };
+                    vt == 9 // VT_DISPATCH
                 }
             }
             Err(_) => false,
