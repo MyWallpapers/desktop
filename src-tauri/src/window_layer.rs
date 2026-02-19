@@ -416,7 +416,8 @@ pub mod mouse_hook {
         use std::os::windows::ffi::OsStrExt;
 
         // Mark Chrome HWND as our target (readable cross-process via GetPropW)
-        let _ = SetPropW(cw, windows::core::w!("MWP_T"), HANDLE(1 as *mut _));
+        let prop_ok = SetPropW(cw, windows::core::w!("MWP_T"), HANDLE(1 as *mut _));
+        log::info!("SetPropW(MWP_T) on Chrome HWND 0x{:X}: ok={}", cw.0 as isize, prop_ok.as_bool());
 
         // Find the hook DLL next to the executable
         let dll_path = match std::env::current_exe() {
@@ -466,10 +467,27 @@ pub mod mouse_hook {
         // Windows loads the DLL into the WebView2 browser process and calls
         // our hook proc there — suppressing spurious WM_MOUSELEAVE.
         match SetWindowsHookExW(WH_GETMESSAGE, hook_proc, hmod, chrome_tid) {
-            Ok(h) => log::info!(
-                "WH_GETMESSAGE hook installed on Chrome thread {} via DLL hook={:?}",
-                chrome_tid, h
-            ),
+            Ok(h) => {
+                log::info!(
+                    "WH_GETMESSAGE hook installed on Chrome thread {} via DLL hook={:?}",
+                    chrome_tid, h
+                );
+                // Diagnostic: monitor suppress count from the DLL
+                let cw_raw = cw.0 as isize;
+                std::thread::spawn(move || {
+                    for i in 0..6 {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        let cw = HWND(cw_raw as *mut core::ffi::c_void);
+                        let sc = GetPropW(cw, windows::core::w!("MWP_SC"));
+                        let count = sc.0 as usize;
+                        log::info!("[DIAG] hook suppress count after {}s: {} (MWP_T={}, MWP_E={})",
+                            (i + 1) * 3, count,
+                            !GetPropW(cw, windows::core::w!("MWP_T")).0.is_null(),
+                            !GetPropW(cw, windows::core::w!("MWP_E")).0.is_null(),
+                        );
+                    }
+                });
+            }
             Err(e) => log::warn!(
                 "Failed to install WH_GETMESSAGE hook on Chrome thread {}: {}",
                 chrome_tid, e

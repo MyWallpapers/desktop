@@ -15,6 +15,7 @@
 //! Cross-process communication via window properties (SetPropW/GetPropW):
 //! - "MWP_T": Target marker — set by host app on Chrome_RenderWidgetHostHWND
 //! - "MWP_E": Explicit leave flag — set by host before intentional WM_MOUSELEAVE
+//! - "MWP_SC": Suppress count — incremented by DLL each suppression (diagnostic)
 
 #![cfg(target_os = "windows")]
 
@@ -23,6 +24,15 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
 const WM_MOUSELEAVE_U32: u32 = 0x02A3;
+
+/// Returns true if the HANDLE represents a set property (non-null).
+/// GetPropW returns NULL (0) when a property doesn't exist.
+/// We avoid HANDLE::is_invalid() because it may check for INVALID_HANDLE_VALUE (-1)
+/// instead of NULL, which would give wrong results for GetPropW.
+#[inline]
+fn prop_is_set(h: HANDLE) -> bool {
+    !h.0.is_null()
+}
 
 /// WH_GETMESSAGE hook procedure — called by Windows in the WebView2 browser process.
 /// Intercepts posted messages before they are dispatched to the window procedure.
@@ -37,15 +47,20 @@ pub unsafe extern "system" fn mouseleave_hook_proc(
         if msg.message == WM_MOUSELEAVE_U32 {
             // Check if this HWND is marked as our target
             let target = GetPropW(msg.hwnd, w!("MWP_T"));
-            if !target.is_invalid() {
+            if prop_is_set(target) {
                 // Check if host explicitly sent this WM_MOUSELEAVE
                 let explicit = GetPropW(msg.hwnd, w!("MWP_E"));
-                if !explicit.is_invalid() {
+                if prop_is_set(explicit) {
                     // Explicit leave from host hook — allow through, clear flag
                     let _ = RemovePropW(msg.hwnd, w!("MWP_E"));
                 } else {
                     // Spurious WM_MOUSELEAVE from TrackMouseEvent — suppress
                     msg.message = WM_NULL;
+
+                    // Diagnostic: increment suppress count property
+                    let prev = GetPropW(msg.hwnd, w!("MWP_SC"));
+                    let count = (prev.0 as usize).wrapping_add(1);
+                    let _ = SetPropW(msg.hwnd, w!("MWP_SC"), HANDLE(count as *mut _));
                 }
             }
         }
