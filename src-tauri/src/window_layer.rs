@@ -255,6 +255,9 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     mouse_hook::set_target_parent_hwnd(detection.target_parent.0 as isize);
     if !detection.syslistview.is_invalid() {
         mouse_hook::set_syslistview_hwnd(detection.syslistview.0 as isize);
+        info!("SysListView32 found: 0x{:X}", detection.syslistview.0 as isize);
+    } else {
+        warn!("SysListView32 NOT FOUND — icon click detection will be disabled");
     }
     mouse_hook::set_app_handle(window.app_handle().clone());
 
@@ -561,8 +564,16 @@ pub mod mouse_hook {
         use windows::core::Interface;
         use std::cell::RefCell;
 
+        // Diagnostic logging — first 5 calls per thread, then every 500th
+        static DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+        let call_n = DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+        let should_log = call_n < 5 || call_n % 500 == 0;
+
         let slv_raw = get_syslistview_hwnd();
-        if slv_raw == 0 { return false; }
+        if slv_raw == 0 {
+            if should_log { log::warn!("[icon-detect] SysListView32 HWND is 0 — skipping"); }
+            return false;
+        }
         let slv = HWND(slv_raw as *mut core::ffi::c_void);
 
         // Cache the COM proxy thread-locally to avoid expensive cross-process
@@ -578,14 +589,15 @@ pub mod mouse_hook {
             if cache_mut.is_none() || cache_mut.as_ref().unwrap().0 != slv_raw {
                 let mut raw_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
                 let objid_client: u32 = 0xFFFFFFFC; // OBJID_CLIENT
-                if AccessibleObjectFromWindow(slv, objid_client, &IAccessible::IID, &mut raw_ptr).is_err()
-                    || raw_ptr.is_null()
-                {
+                let hr = AccessibleObjectFromWindow(slv, objid_client, &IAccessible::IID, &mut raw_ptr);
+                if hr.is_err() || raw_ptr.is_null() {
+                    if should_log { log::warn!("[icon-detect] AccessibleObjectFromWindow failed for SLV 0x{:X}: {:?}", slv_raw, hr); }
                     *cache_mut = None;
                     return false;
                 }
                 let acc: IAccessible = IAccessible::from_raw(raw_ptr);
                 *cache_mut = Some((slv_raw, acc));
+                if should_log { log::info!("[icon-detect] IAccessible proxy created for SLV 0x{:X}", slv_raw); }
             }
 
             if let Some((_, acc)) = cache_mut.as_ref() {
@@ -594,16 +606,18 @@ pub mod mouse_hook {
                 match acc.accHitTest(x, y) {
                     Ok(hit) => {
                         if let Ok(val) = i32::try_from(&hit) {
-                            val > 0
+                            let result = val > 0;
+                            if should_log { log::info!("[icon-detect] accHitTest({},{}) = VT_I4({}) → {}", x, y, val, result); }
+                            result
                         } else {
-                            // Only VT_DISPATCH (=9) means a child accessible object (icon).
-                            // VT_EMPTY, VT_NULL, or any other type = not an icon.
                             let vt = hit.as_raw().Anonymous.Anonymous.vt;
-                            vt == 9 // VT_DISPATCH
+                            let result = vt == 9; // VT_DISPATCH
+                            if should_log { log::info!("[icon-detect] accHitTest({},{}) = vt={} → {}", x, y, vt, result); }
+                            result
                         }
                     }
-                    Err(_) => {
-                        // COM proxy invalid (Explorer restarted?) — clear cache
+                    Err(e) => {
+                        if should_log { log::warn!("[icon-detect] accHitTest failed: {:?} — clearing cache", e); }
                         *cache_mut = None;
                         false
                     }
@@ -806,7 +820,9 @@ pub mod mouse_hook {
                         // Cannot rely on stale OVER_ICON: user may have moved from empty
                         // space to icon between background polls (16ms window).
                         if is_down {
-                            if is_mouse_over_desktop_icon(pt.x, pt.y) {
+                            let over_icon = is_mouse_over_desktop_icon(pt.x, pt.y);
+                            log::info!("[hook] mousedown at ({},{}) hwnd=0x{:X} over_icon={}", pt.x, pt.y, hwnd_under.0 as isize, over_icon);
+                            if over_icon {
                                 OVER_ICON.store(true, Ordering::Relaxed);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
                                 return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
