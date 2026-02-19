@@ -348,7 +348,7 @@ pub fn try_refresh_desktop() -> bool {
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU8, Ordering};
     use std::sync::OnceLock;
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -395,6 +395,13 @@ pub mod mouse_hook {
 
     /// Tracks whether cursor was over desktop on previous move (for SendMouseInput LEAVE)
     static WAS_OVER_DESKTOP: AtomicBool = AtomicBool::new(false);
+
+    // --- Background COM thread bridge ---
+    // The hook writes cursor coords here; a background thread polls and updates OVER_ICON.
+    // This keeps accHitTest (cross-process COM RPC) out of the WH_MOUSE_LL hot path.
+    static HOVER_X: AtomicI32 = AtomicI32::new(0);
+    static HOVER_Y: AtomicI32 = AtomicI32::new(0);
+    static NEEDS_ICON_CHECK: AtomicBool = AtomicBool::new(false);
 
     // --- UI thread dispatch for SendMouseInput (STA-bound) ---
     // SendMouseInput must be called from the thread that created the composition controller.
@@ -686,6 +693,25 @@ pub mod mouse_hook {
     }
 
     pub fn start_hook_thread() {
+        // Background COM thread — polls HOVER_X/Y at ~60Hz and updates OVER_ICON.
+        // This keeps the expensive cross-process accHitTest RPC out of the hook.
+        std::thread::spawn(|| {
+            unsafe {
+                use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            loop {
+                if NEEDS_ICON_CHECK.swap(false, Ordering::Relaxed) {
+                    let x = HOVER_X.load(Ordering::Relaxed);
+                    let y = HOVER_Y.load(Ordering::Relaxed);
+                    let over = unsafe { is_mouse_over_desktop_icon(x, y) };
+                    OVER_ICON.store(over, Ordering::Relaxed);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+        });
+
+        // OS hook thread
         std::thread::spawn(|| {
             unsafe {
                 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -731,7 +757,6 @@ pub mod mouse_hook {
                         if !is_over_desktop {
                             OVER_ICON.store(false, Ordering::Relaxed);
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
-                                // Send (0,0) — WebView2 rejects negative/out-of-bounds coords (0x80070057)
                                 send_input(MOUSE_LEAVE, VK_NONE, 0, 0, 0);
                             }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
@@ -740,17 +765,19 @@ pub mod mouse_hook {
                         // Cursor is over desktop in IDLE state
                         if msg == WM_MOUSEMOVE {
                             WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
-                            // Throttled icon hover detection — every 8th move (~8ms at 125Hz)
+                            // Signal background thread for async icon hover check.
+                            // No COM call here — hook returns instantly.
                             let tick = ICON_CHECK_TICK.fetch_add(1, Ordering::Relaxed);
                             if tick % 8 == 0 {
-                                OVER_ICON.store(
-                                    is_mouse_over_desktop_icon(pt.x, pt.y),
-                                    Ordering::Relaxed,
-                                );
+                                HOVER_X.store(pt.x, Ordering::Relaxed);
+                                HOVER_Y.store(pt.y, Ordering::Relaxed);
+                                NEEDS_ICON_CHECK.store(true, Ordering::Relaxed);
                             }
                         }
 
-                        // State transition on mousedown — always do precise icon check
+                        // State transition on mousedown — synchronous check required.
+                        // Cannot rely on stale OVER_ICON: user may have moved from empty
+                        // space to icon between background polls (16ms window).
                         if is_down {
                             if is_mouse_over_desktop_icon(pt.x, pt.y) {
                                 OVER_ICON.store(true, Ordering::Relaxed);
@@ -763,7 +790,6 @@ pub mod mouse_hook {
                         }
 
                         // If hovering over a desktop icon, pass all events to OS
-                        // (the "icon owns all inputs" behavior)
                         if OVER_ICON.load(Ordering::Relaxed) {
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
