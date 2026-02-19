@@ -298,6 +298,18 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
         let _ = SetWindowPos(our_hwnd, HWND::default(),
             0, 0, parent_rect.right, parent_rect.bottom,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+
+        // ── Force WebView2 bounds update ──
+        // Tauri/wry set WebView2 controller bounds during init based on the ORIGINAL
+        // client area (offset by WS_THICKFRAME's ~7px). After stripping styles and
+        // resizing, the client area expanded but WebView2 bounds are stale.
+        // Sending WM_SIZE triggers wry's resize handler → put_Bounds() with correct rect.
+        let w = parent_rect.right as u16 as u32;
+        let h = parent_rect.bottom as u16 as u32;
+        let _ = SendMessageW(our_hwnd, WM_SIZE, WPARAM(0), LPARAM(((h << 16) | w) as isize));
+
+        log::info!("Injection complete: parent={}x{}, HWND at (0,0)",
+            parent_rect.right, parent_rect.bottom);
     }
 }
 
@@ -696,66 +708,31 @@ pub mod mouse_hook {
     static CACHED_IS_DESKTOP: AtomicBool = AtomicBool::new(false);
 
     /// Whether the cursor is currently hovering over a desktop icon (continuous tracking in IDLE).
-    /// When true, ALL mouse events pass to OS — the "icon owns all inputs" behavior.
     static OVER_ICON: AtomicBool = AtomicBool::new(false);
     /// Tick counter for throttled icon hover checks (every 8th MOUSE_MOVE)
     static ICON_CHECK_TICK: AtomicU32 = AtomicU32::new(0);
-    /// Tracks whether WS_EX_TRANSPARENT is currently set on the WebView
-    static WV_TRANSPARENT: AtomicBool = AtomicBool::new(false);
+    /// Tracks whether the WebView HWND is currently disabled (EnableWindow FALSE).
+    /// When disabled, WindowFromPoint skips our window → system dispatches directly
+    /// to SysListView32. This enables native DragDetect, double-click, and all
+    /// icon interactions without PostMessage or WS_EX_TRANSPARENT.
+    static WV_DISABLED: AtomicBool = AtomicBool::new(false);
 
-    // --- Double-click synthesis ---
-    // Windows doesn't generate WM_LBUTTONDBLCLK for PostMessage'd WM_LBUTTONDOWN events.
-    // We detect double-clicks manually using MSLLHOOKSTRUCT.time (kernel tick count, ms).
-    static LAST_CLICK_TIME: AtomicU32 = AtomicU32::new(0);
-    static LAST_CLICK_X: AtomicI32 = AtomicI32::new(0);
-    static LAST_CLICK_Y: AtomicI32 = AtomicI32::new(0);
-    // Cached system metrics (rarely change, no need to syscall every mousedown)
-    static DBL_CLICK_TIME: AtomicU32 = AtomicU32::new(0);
-    static DBL_CLICK_CX: AtomicI32 = AtomicI32::new(0);
-    static DBL_CLICK_CY: AtomicI32 = AtomicI32::new(0);
-
-
-    /// Toggle WS_EX_TRANSPARENT on the WebView to make it click-through.
-    /// When set, WindowFromPoint skips our window and clicks reach the icons behind.
-    /// WebView2 composition mode renders via DirectComposition which overlays HWND Z-order,
-    /// so the only way to let clicks through is to make the entire HWND transparent to hit-tests.
+    /// Disable the WebView HWND for hit-testing bypass.
+    /// WindowFromPoint skips disabled windows → events flow to SysListView32 natively.
+    /// DirectComposition rendering is unaffected (visual output continues).
     #[inline]
-    unsafe fn set_webview_click_through(wv: HWND, transparent: bool) {
-        let was = WV_TRANSPARENT.swap(transparent, Ordering::Relaxed);
-        if was == transparent { return; } // No change
-        let ex = GetWindowLongW(wv, GWL_EXSTYLE);
-        if transparent {
-            let _ = SetWindowLongW(wv, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT.0 as i32);
-        } else {
-            let _ = SetWindowLongW(wv, GWL_EXSTYLE, ex & !(WS_EX_TRANSPARENT.0 as i32));
+    unsafe fn disable_webview(wv: HWND) {
+        if !WV_DISABLED.swap(true, Ordering::Relaxed) {
+            let _ = EnableWindow(wv, false);
         }
-        // CRITICAL: SetWindowLong caches style data. SetWindowPos with SWP_FRAMECHANGED
-        // forces Windows to recalculate hit-testing with the new WS_EX_TRANSPARENT state.
-        // Without this, the system ignores the style change for click delivery.
-        let _ = SetWindowPos(wv, HWND::default(), 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
 
-    /// PostMessage a mouse event to SysListView32 for guaranteed delivery.
-    /// WS_EX_TRANSPARENT doesn't affect child window hit-testing on Win11,
-    /// so we need direct delivery for the initial interactions (hover + mousedown).
-    /// SysListView32 then calls SetCapture, allowing real events for drag & drop.
+    /// Re-enable the WebView HWND for normal interaction.
     #[inline]
-    unsafe fn forward_to_syslistview(msg: u32, pt: windows::Win32::Foundation::POINT) {
-        use windows::Win32::Graphics::Gdi::ScreenToClient;
-        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
-        let slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
-        if slv.is_invalid() { return; }
-        let mut client_pt = pt;
-        let _ = ScreenToClient(slv, &mut client_pt);
-        let mut mk: u32 = 0;
-        if GetKeyState(0x01) < 0 { mk |= 0x0001; } // MK_LBUTTON
-        if GetKeyState(0x02) < 0 { mk |= 0x0002; } // MK_RBUTTON
-        if GetKeyState(0x10) < 0 { mk |= 0x0004; } // MK_SHIFT
-        if GetKeyState(0x11) < 0 { mk |= 0x0008; } // MK_CONTROL
-        if GetKeyState(0x04) < 0 { mk |= 0x0010; } // MK_MBUTTON
-        let lp = LPARAM(((client_pt.y as u32 & 0xFFFF) << 16 | (client_pt.x as u32 & 0xFFFF)) as isize);
-        let _ = PostMessageW(slv, msg, WPARAM(mk as usize), lp);
+    unsafe fn enable_webview(wv: HWND) {
+        if WV_DISABLED.swap(false, Ordering::Relaxed) {
+            let _ = EnableWindow(wv, true);
+        }
     }
 
     /// Check if hwnd_under is part of the desktop hierarchy, with caching.
@@ -869,14 +846,6 @@ pub mod mouse_hook {
             }
         });
 
-        // Cache double-click metrics once (syscall-free in the hot path)
-        unsafe {
-            use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
-            DBL_CLICK_TIME.store(GetDoubleClickTime(), Ordering::Relaxed);
-            DBL_CLICK_CX.store(GetSystemMetrics(SM_CXDOUBLECLK), Ordering::Relaxed);
-            DBL_CLICK_CY.store(GetSystemMetrics(SM_CYDOUBLECLK), Ordering::Relaxed);
-        }
-
         // OS hook thread — elevated priority to prevent WH_MOUSE_LL timeout
         std::thread::spawn(|| {
             unsafe {
@@ -901,19 +870,16 @@ pub mod mouse_hook {
                         let state = HOOK_STATE.load(Ordering::Relaxed);
 
                         // ── Fast path: STATE_NATIVE ──
-                        // Dual delivery: PostMessage for guaranteed SysListView32 delivery
-                        // + CallNextHookEx so real events flow through the system.
-                        // LRESULT(1) would prevent the system from updating GetAsyncKeyState,
-                        // which breaks DragDetect()'s modal loop and SysListView32's drag detection.
-                        // Real hardware events must flow for OLE Drag & SetCapture to work.
+                        // WebView is disabled (EnableWindow FALSE) → WindowFromPoint skips it.
+                        // System dispatches real hardware events directly to SysListView32.
+                        // This enables native DragDetect, SetCapture, OLE Drag & Drop,
+                        // double-click detection — all without PostMessage or synthesis.
                         if state == STATE_NATIVE {
                             if is_up {
-                                forward_to_syslistview(msg, pt);
                                 HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
-                            } else if msg == WM_MOUSEMOVE {
-                                forward_to_syslistview(msg, pt);
-                            } else if is_down {
-                                forward_to_syslistview(msg, pt);
+                                // Don't re-enable here — defer to IDLE handler when
+                                // OVER_ICON transitions to false (mouseup dispatch must
+                                // reach SysListView32 while window is still disabled).
                             }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
@@ -936,7 +902,7 @@ pub mod mouse_hook {
 
                         if !is_over_desktop {
                             OVER_ICON.store(false, Ordering::Relaxed);
-                            set_webview_click_through(wv, false);
+                            enable_webview(wv);
                             if WAS_OVER_DESKTOP.swap(false, Ordering::Relaxed) {
                                 send_input(MOUSE_LEAVE, VK_NONE, 0, 0, 0);
                             }
@@ -946,69 +912,48 @@ pub mod mouse_hook {
                         // Cursor is over desktop in IDLE state
                         if msg == WM_MOUSEMOVE {
                             WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
-                            // Signal background thread for async icon hover check.
-                            // No COM call here — hook returns instantly.
+                            // Signal background thread for async icon hover check
                             let tick = ICON_CHECK_TICK.fetch_add(1, Ordering::Relaxed);
                             if tick % 8 == 0 {
                                 HOVER_X.store(pt.x, Ordering::Relaxed);
                                 HOVER_Y.store(pt.y, Ordering::Relaxed);
                                 NEEDS_ICON_CHECK.store(true, Ordering::Relaxed);
                             }
-                            // Sync click-through state with background thread's OVER_ICON
+                            // Sync enable/disable with OVER_ICON from background thread.
+                            // When disabled, system dispatches moves to SysListView32 →
+                            // native hover highlighting without PostMessage.
                             let icon_flag = OVER_ICON.load(Ordering::Relaxed);
-                            set_webview_click_through(wv, icon_flag);
+                            if icon_flag {
+                                disable_webview(wv);
+                            } else {
+                                enable_webview(wv);
+                            }
                         }
 
                         // State transition on mousedown — synchronous check required.
-                        // Cannot rely on stale OVER_ICON: user may have moved from empty
-                        // space to icon between background polls (16ms window).
                         if is_down {
                             let over_icon = is_mouse_over_desktop_icon(pt.x, pt.y);
-                            log::info!("[hook] mousedown ({},{}) hwnd=0x{:X} desktop={} icon={} transparent={}",
+                            log::info!("[hook] mousedown ({},{}) hwnd=0x{:X} desktop={} icon={} disabled={}",
                                 pt.x, pt.y, hwnd_under.0 as isize, is_over_desktop, over_icon,
-                                WV_TRANSPARENT.load(Ordering::Relaxed));
+                                WV_DISABLED.load(Ordering::Relaxed));
                             if over_icon {
                                 OVER_ICON.store(true, Ordering::Relaxed);
+                                // Disable WebView BEFORE CallNextHookEx — system dispatch
+                                // skips disabled windows → event goes to SysListView32.
+                                // All native mechanisms work: DragDetect, SetCapture, double-click.
+                                disable_webview(wv);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
-
-                                // Double-click synthesis for left button:
-                                // Windows doesn't generate WM_LBUTTONDBLCLK for PostMessage'd events.
-                                // Uses info.time (kernel tick count, ms) — zero-cost, already in hook data.
-                                if msg == WM_LBUTTONDOWN {
-                                    let now = info.time;
-                                    let prev = LAST_CLICK_TIME.load(Ordering::Relaxed);
-                                    let elapsed = now.wrapping_sub(prev); // handles tick wraparound
-                                    if elapsed <= DBL_CLICK_TIME.load(Ordering::Relaxed)
-                                        && (pt.x - LAST_CLICK_X.load(Ordering::Relaxed)).abs() <= DBL_CLICK_CX.load(Ordering::Relaxed)
-                                        && (pt.y - LAST_CLICK_Y.load(Ordering::Relaxed)).abs() <= DBL_CLICK_CY.load(Ordering::Relaxed)
-                                    {
-                                        log::info!("[hook] double-click detected ({},{})", pt.x, pt.y);
-                                        forward_to_syslistview(0x0203, pt); // WM_LBUTTONDBLCLK
-                                        LAST_CLICK_TIME.store(0, Ordering::Relaxed);
-                                        return LRESULT(1);
-                                    }
-                                    LAST_CLICK_TIME.store(now, Ordering::Relaxed);
-                                    LAST_CLICK_X.store(pt.x, Ordering::Relaxed);
-                                    LAST_CLICK_Y.store(pt.y, Ordering::Relaxed);
-                                }
-
-                                // PostMessage for guaranteed delivery + CallNextHookEx
-                                // to let the system register button state (GetAsyncKeyState).
-                                forward_to_syslistview(msg, pt);
                                 return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             }
                             OVER_ICON.store(false, Ordering::Relaxed);
-                            set_webview_click_through(wv, false);
+                            enable_webview(wv);
                             HOOK_STATE.store(STATE_WEB, Ordering::Relaxed);
                             WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
                         }
 
-                        // If hovering over a desktop icon, PostMessage for hover highlighting
-                        // + CallNextHookEx so real events flow through the system.
+                        // If hovering over icon (WebView disabled), let system handle.
+                        // Events go to SysListView32 natively via CallNextHookEx.
                         if OVER_ICON.load(Ordering::Relaxed) {
-                            if msg == WM_MOUSEMOVE {
-                                forward_to_syslistview(msg, pt);
-                            }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
