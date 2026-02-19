@@ -371,7 +371,7 @@ pub fn try_refresh_desktop() -> bool {
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU8, Ordering};
     use std::sync::OnceLock;
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -661,11 +661,6 @@ pub mod mouse_hook {
     /// Tracks whether WS_EX_TRANSPARENT is currently set on the WebView
     static WV_TRANSPARENT: AtomicBool = AtomicBool::new(false);
 
-    /// Double-click detection — track last click time and position to synthesize
-    /// WM_LBUTTONDBLCLK since we consume raw clicks via PostMessage.
-    static LAST_CLICK_TIME: AtomicU64 = AtomicU64::new(0);
-    static LAST_CLICK_X: AtomicI32 = AtomicI32::new(0);
-    static LAST_CLICK_Y: AtomicI32 = AtomicI32::new(0);
 
     /// Toggle WS_EX_TRANSPARENT on the WebView to make it click-through.
     /// When set, WindowFromPoint skips our window and clicks reach the icons behind.
@@ -681,28 +676,6 @@ pub mod mouse_hook {
         } else {
             let _ = SetWindowLongW(wv, GWL_EXSTYLE, ex & !(WS_EX_TRANSPARENT.0 as i32));
         }
-    }
-
-    /// Forward a mouse message directly to SysListView32 via PostMessageW.
-    /// This bypasses the HWND Z-order issue where WebView2's DirectComposition
-    /// visual intercepts clicks even with WS_EX_TRANSPARENT set.
-    #[inline]
-    unsafe fn forward_to_syslistview(msg: u32, pt: windows::Win32::Foundation::POINT) {
-        use windows::Win32::Graphics::Gdi::ScreenToClient;
-        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
-        let slv = HWND(get_syslistview_hwnd() as *mut core::ffi::c_void);
-        if slv.is_invalid() { return; }
-        let mut client_pt = pt;
-        let _ = ScreenToClient(slv, &mut client_pt);
-        // Build wparam with current key state flags (MK_*)
-        let mut mk: u32 = 0;
-        if GetKeyState(0x01) < 0 { mk |= 0x0001; } // MK_LBUTTON
-        if GetKeyState(0x02) < 0 { mk |= 0x0002; } // MK_RBUTTON
-        if GetKeyState(0x10) < 0 { mk |= 0x0004; } // MK_SHIFT
-        if GetKeyState(0x11) < 0 { mk |= 0x0008; } // MK_CONTROL
-        if GetKeyState(0x04) < 0 { mk |= 0x0010; } // MK_MBUTTON
-        let lp = LPARAM(((client_pt.y as u32 & 0xFFFF) << 16 | (client_pt.x as u32 & 0xFFFF)) as isize);
-        let _ = PostMessageW(slv, msg, WPARAM(mk as usize), lp);
     }
 
     /// Check if hwnd_under is part of the desktop hierarchy, with caching.
@@ -839,46 +812,15 @@ pub mod mouse_hook {
                         let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
                         let state = HOOK_STATE.load(Ordering::Relaxed);
 
-                        // ── Double-click synthesis ──
-                        // Since we consume raw clicks via PostMessage, Windows can't
-                        // detect double-clicks. We track timing ourselves.
-                        let mut actual_msg = msg;
-                        if is_down {
-                            use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default().as_millis() as u64;
-                            let dbl_time = GetDoubleClickTime() as u64;
-                            let dx = (pt.x - LAST_CLICK_X.load(Ordering::Relaxed)).abs();
-                            let dy = (pt.y - LAST_CLICK_Y.load(Ordering::Relaxed)).abs();
-                            let cx = GetSystemMetrics(SM_CXDOUBLECLK);
-                            let cy = GetSystemMetrics(SM_CYDOUBLECLK);
-                            if now - LAST_CLICK_TIME.load(Ordering::Relaxed) <= dbl_time
-                                && dx <= cx / 2 && dy <= cy / 2
-                            {
-                                if msg == WM_LBUTTONDOWN { actual_msg = 0x0203; } // WM_LBUTTONDBLCLK
-                                else if msg == WM_RBUTTONDOWN { actual_msg = 0x0206; } // WM_RBUTTONDBLCLK
-                                else if msg == WM_MBUTTONDOWN { actual_msg = 0x0209; } // WM_MBUTTONDBLCLK
-                                // Reset so triple-click doesn't re-trigger dblclk
-                                LAST_CLICK_TIME.store(0, Ordering::Relaxed);
-                            } else {
-                                LAST_CLICK_TIME.store(now, Ordering::Relaxed);
-                            }
-                            LAST_CLICK_X.store(pt.x, Ordering::Relaxed);
-                            LAST_CLICK_Y.store(pt.y, Ordering::Relaxed);
-                        }
-
-                        // ── Fast path: STATE_NATIVE — forward to SysListView32 ──
-                        // We consume the event and PostMessage it directly to SysListView32
-                        // because CallNextHookEx delivers clicks to the WebView (on top in
-                        // DirectComposition Z-order), not to the icon window behind it.
+                        // ── Fast path: STATE_NATIVE ──
+                        // WebView is WS_EX_TRANSPARENT so real hardware events reach
+                        // SysListView32 natively. This preserves Drag & Drop (OLE Drag
+                        // needs real events) and double-click detection by Windows.
                         if state == STATE_NATIVE {
-                            forward_to_syslistview(if is_down { actual_msg } else { msg }, pt);
                             if is_up {
                                 HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
-                                set_webview_click_through(wv, false);
                             }
-                            return LRESULT(1); // Consume — we forwarded directly
+                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
                         // ── Fast path: STATE_WEB — forward to WebView, skip desktop detection ──
@@ -930,9 +872,9 @@ pub mod mouse_hook {
                             if over_icon {
                                 OVER_ICON.store(true, Ordering::Relaxed);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
-                                // Forward click (or dblclk) directly to SysListView32
-                                forward_to_syslistview(actual_msg, pt);
-                                return LRESULT(1); // Consume — forwarded directly
+                                // Ensure WebView is transparent so real click reaches icons
+                                set_webview_click_through(wv, true);
+                                return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                             }
                             OVER_ICON.store(false, Ordering::Relaxed);
                             set_webview_click_through(wv, false);
@@ -940,12 +882,9 @@ pub mod mouse_hook {
                             WAS_OVER_DESKTOP.store(true, Ordering::Relaxed);
                         }
 
-                        // If hovering over a desktop icon, forward moves to SysListView32
-                        // so icons get hover/highlight effects, and consume the event.
+                        // If hovering over a desktop icon, let events pass natively
+                        // (WS_EX_TRANSPARENT is set so moves reach SysListView32 for highlights)
                         if OVER_ICON.load(Ordering::Relaxed) {
-                            if msg == WM_MOUSEMOVE {
-                                forward_to_syslistview(msg, pt);
-                            }
                             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
 
