@@ -2390,12 +2390,26 @@ pub unsafe fn set_controller_bounds_raw(
   let controller: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller =
     comp.cast().map_err(|e| format!("QI for ICoreWebView2Controller failed: {}", e))?;
 
+  // 1. Update WebView2 rendering bounds
   controller.SetBounds(RECT {
     left: 0,
     top: 0,
     right: width,
     bottom: height,
   }).map_err(|e| format!("SetBounds failed: {}", e))?;
+
+  // 2. Reposition the container HWND (wry creates this as a child of the main window).
+  //    After style stripping (WS_THICKFRAME removed), the container may still be at
+  //    the old offset. This mirrors what wry's WM_SIZE handler does.
+  use windows::Win32::Foundation::HWND;
+  use windows::Win32::UI::WindowsAndMessaging::*;
+  let mut container = HWND::default();
+  if controller.ParentWindow(&mut container).is_ok() && !container.is_invalid() {
+    let _ = SetWindowPos(
+      container, None, 0, 0, width, height,
+      SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER,
+    );
+  }
 
   Ok(())
 }
