@@ -676,6 +676,11 @@ pub mod mouse_hook {
         } else {
             let _ = SetWindowLongW(wv, GWL_EXSTYLE, ex & !(WS_EX_TRANSPARENT.0 as i32));
         }
+        // CRITICAL: SetWindowLong caches style data. SetWindowPos with SWP_FRAMECHANGED
+        // forces Windows to recalculate hit-testing with the new WS_EX_TRANSPARENT state.
+        // Without this, the system ignores the style change for click delivery.
+        let _ = SetWindowPos(wv, HWND::default(), 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
 
     /// Check if hwnd_under is part of the desktop hierarchy, with caching.
@@ -869,6 +874,9 @@ pub mod mouse_hook {
                         // space to icon between background polls (16ms window).
                         if is_down {
                             let over_icon = is_mouse_over_desktop_icon(pt.x, pt.y);
+                            log::info!("[hook] mousedown ({},{}) hwnd=0x{:X} desktop={} icon={} transparent={}",
+                                pt.x, pt.y, hwnd_under.0 as isize, is_over_desktop, over_icon,
+                                WV_TRANSPARENT.load(Ordering::Relaxed));
                             if over_icon {
                                 OVER_ICON.store(true, Ordering::Relaxed);
                                 HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
