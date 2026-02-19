@@ -472,7 +472,7 @@ pub mod mouse_hook {
         // Atomic-coalesced mouse move — reads latest coords from atomics.
         // At most 1 of these is ever pending, regardless of mouse polling rate.
         if msg == WM_MWP_MOUSE_MOVE {
-            MOVE_QUEUED.store(false, Ordering::Acquire);
+            MOVE_QUEUED.store(false, Ordering::Release);
             let x = PENDING_MOVE_X.load(Ordering::Relaxed);
             let y = PENDING_MOVE_Y.load(Ordering::Relaxed);
             let vk = DRAG_VK.load(Ordering::Relaxed) as i32;
