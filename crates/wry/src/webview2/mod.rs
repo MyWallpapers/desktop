@@ -1353,7 +1353,7 @@ impl InnerWebView {
               0,
               width,
               height,
-              SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER,
+              SWP_NOACTIVATE | SWP_NOZORDER,
             );
           }
         }

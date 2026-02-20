@@ -2401,13 +2401,14 @@ pub unsafe fn set_controller_bounds_raw(
   // 2. Reposition the container HWND (wry creates this as a child of the main window).
   //    After style stripping (WS_THICKFRAME removed), the container may still be at
   //    the old offset. This mirrors what wry's WM_SIZE handler does.
+  //    IMPORTANT: no SWP_ASYNCWINDOWPOS — must be synchronous to take effect immediately.
   use windows::Win32::Foundation::HWND;
   use windows::Win32::UI::WindowsAndMessaging::*;
   let mut container = HWND::default();
   if controller.ParentWindow(&mut container).is_ok() && !container.is_invalid() {
     let _ = SetWindowPos(
       container, None, 0, 0, width, height,
-      SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER,
+      SWP_NOACTIVATE | SWP_NOZORDER,
     );
   }
 
