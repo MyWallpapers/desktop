@@ -207,20 +207,14 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             LPARAM(&mut syslistview as *mut _ as isize),
         );
 
-        // Get screen dimensions for SetBounds.
-        // NOTE: GetClientRect(Progman) returns 640x480 on Win11 24H2 — NOT the actual
-        // screen resolution. Use the monitor's work area instead.
-        use windows::Win32::Graphics::Gdi::{MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
-        let monitor = MonitorFromWindow(target_parent, MONITOR_DEFAULTTOPRIMARY);
-        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        let _ = GetMonitorInfoW(monitor, &mut mi);
-        let screen_w = mi.rcMonitor.right - mi.rcMonitor.left;
-        let screen_h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        // Get parent client rect dimensions for SetBounds
+        let mut parent_rect = windows::Win32::Foundation::RECT::default();
+        let _ = GetClientRect(target_parent, &mut parent_rect);
 
         Ok(DesktopDetection {
             is_24h2, target_parent, shell_view, os_workerw, syslistview,
-            parent_width: screen_w,
-            parent_height: screen_h,
+            parent_width: parent_rect.right,
+            parent_height: parent_rect.bottom,
         })
     }
 }
