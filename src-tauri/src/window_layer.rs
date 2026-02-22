@@ -291,15 +291,27 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     // State dump: window hierarchy, styles, positions, Z-order
     dump_state(our_hwnd, &detection);
 
-    // WebView2 bounds — always poll (controller may not be ready yet)
+    // WebView2 bounds — poll for controller, then marshal SetBounds to main thread
     let (w, h) = (detection.parent_width, detection.parent_height);
     std::thread::spawn(move || {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
         for _ in 0..60 {
             let ptr = wry::get_last_composition_controller_ptr();
             if ptr != 0 {
                 mouse_hook::set_comp_controller_ptr(ptr);
-                let bounds_result = unsafe { wry::set_controller_bounds_raw(ptr, w, h) };
-                log::info!("[diag] CompController=0x{:X} bounds={}x{} result={:?}", ptr, w, h, bounds_result);
+                log::info!("[diag] CompController=0x{:X}, requesting SetBounds {}x{} on main thread", ptr, w, h);
+                // Marshal SetBounds to main thread via dispatch window
+                let dh = mouse_hook::get_dispatch_hwnd();
+                if dh != 0 {
+                    unsafe {
+                        let _ = PostMessageW(HWND(dh as *mut _),
+                            mouse_hook::WM_MWP_SETBOUNDS_PUB,
+                            WPARAM(w as usize), LPARAM(h as isize));
+                    }
+                } else {
+                    log::error!("[diag] CompController ready but dispatch window not yet created");
+                }
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -355,6 +367,7 @@ pub mod mouse_hook {
     static DIAG_MISS_LOGGED: AtomicBool = AtomicBool::new(false);
 
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
+    const WM_MWP_SETBOUNDS: u32 = 0x8000 + 43;
 
     pub fn set_webview_hwnd(h: isize)        { WEBVIEW_HWND.store(h, Ordering::SeqCst); }
     pub fn set_syslistview_hwnd(h: isize)    { SYSLISTVIEW_HWND.store(h, Ordering::SeqCst); }
@@ -362,6 +375,8 @@ pub mod mouse_hook {
     pub fn get_syslistview_hwnd() -> isize   { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
     pub fn set_comp_controller_ptr(p: isize) { COMP_CONTROLLER_PTR.store(p, Ordering::SeqCst); }
     pub fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
+    pub fn get_dispatch_hwnd() -> isize { DISPATCH_HWND.load(Ordering::SeqCst) }
+    pub const WM_MWP_SETBOUNDS_PUB: u32 = WM_MWP_SETBOUNDS;
 
     static DIAG_POST_FAIL: AtomicBool = AtomicBool::new(true);
 
@@ -384,6 +399,16 @@ pub mod mouse_hook {
     }
 
     unsafe extern "system" fn dispatch_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        if msg == WM_MWP_SETBOUNDS {
+            let w = wp.0 as i32;
+            let h = lp.0 as i32;
+            let ptr = get_comp_controller_ptr();
+            if ptr != 0 {
+                let result = wry::set_controller_bounds_raw(ptr, w, h);
+                log::info!("[diag] SetBounds (main thread): {}x{} result={:?}", w, h, result);
+            }
+            return LRESULT(0);
+        }
         if msg == WM_MWP_MOUSE {
             let kind = (wp.0 & 0xFFFF) as i32;
             let vk = ((wp.0 >> 16) & 0xFFFF) as i32;
@@ -425,14 +450,22 @@ pub mod mouse_hook {
         }
     }
 
-    /// Cursor is over the desktop if it hits our target_parent, any of its
-    /// children (WebView, SHELLDLL_DefView in 24H2…), or SysListView32
-    /// (explicit check needed for Legacy mode where it's outside target_parent).
+    /// Cursor is over the desktop area. Checks:
+    /// 1. Direct hit on target_parent (Progman/WorkerW) or SysListView32
+    /// 2. Child of target_parent (SHELLDLL_DefView, our Tauri Window, etc.)
+    /// 3. Same-process window (WebView2's Chrome_RenderWidgetHostHWND sits
+    ///    outside the HWND hierarchy in composition mode)
     #[inline]
     unsafe fn is_over_desktop(hwnd_under: HWND) -> bool {
         let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut _);
         let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
-        hwnd_under == tp || IsChild(tp, hwnd_under).as_bool() || hwnd_under == slv
+        if hwnd_under == tp || hwnd_under == slv || IsChild(tp, hwnd_under).as_bool() {
+            return true;
+        }
+        // Composition mode: Chrome_RenderWidgetHostHWND is detached from Progman tree
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd_under, Some(&mut pid));
+        pid != 0 && pid == std::process::id()
     }
 
     #[inline]
