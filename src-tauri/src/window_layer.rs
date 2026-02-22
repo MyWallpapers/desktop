@@ -91,115 +91,68 @@ struct DesktopDetection {
 
 #[cfg(target_os = "windows")]
 fn detect_desktop() -> Result<DesktopDetection, String> {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
     use windows::Win32::UI::WindowsAndMessaging::*;
-
-    debug!("[detect_desktop] Initiating desktop window detection...");
 
     unsafe {
         let progman = FindWindowW(windows::core::w!("Progman"), None)
-            .map_err(|_| "Could not find Progman. Explorer might be crashed.".to_string())?;
+            .map_err(|_| "Could not find Progman.".to_string())?;
 
         info!("[detect_desktop] Found Progman HWND: 0x{:X}", progman.0 as isize);
 
-        // Send message to spawn WorkerW if it doesn't exist
-        debug!("[detect_desktop] Sending 0x052C message to Progman to trigger WorkerW spawn...");
+        // Force Windows to create the special wallpaper WorkerW
         let mut msg_result: usize = 0;
-        let _ = SendMessageTimeoutW(
-            progman,
-            0x052C,
-            WPARAM(0x0D),
-            LPARAM(1),
-            SMTO_NORMAL,
-            1000,
-            Some(&mut msg_result),
-        );
-        debug!("[detect_desktop] 0x052C message sent. Result: {}", msg_result);
+        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
 
         let mut is_24h2 = false;
         let mut target_parent = HWND::default();
         let mut shell_view = HWND::default();
         let mut os_workerw = HWND::default();
 
-        debug!("[detect_desktop] Polling for hierarchy resolution (max 40 attempts)...");
         for attempt in 1..=40 {
-            // Check for Windows 11 24H2+ layout: SHELLDLL_DefView inside Progman
-            let sv = FindWindowExW(
-                progman,
-                HWND::default(),
-                windows::core::w!("SHELLDLL_DefView"),
-                None,
-            ).unwrap_or_default();
-
-            let ww = FindWindowExW(
-                progman,
-                HWND::default(),
-                windows::core::w!("WorkerW"),
-                None,
-            ).unwrap_or_default();
+            // Check for Windows 11 24H2+ layout
+            let sv = FindWindowExW(progman, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
+            let ww = FindWindowExW(progman, HWND::default(), windows::core::w!("WorkerW"), None).unwrap_or_default();
 
             if !sv.is_invalid() && !ww.is_invalid() {
                 info!("[detect_desktop] Discovered Windows 11 24H2+ architecture on attempt {}", attempt);
                 is_24h2 = true;
-                target_parent = progman;
+                target_parent = ww; // FIX: Inject INTO WorkerW, not Progman
                 shell_view = sv;
                 os_workerw = ww;
                 break;
             }
 
-            // Check for Standard Windows 10 / Windows 11 layout: SHELLDLL_DefView inside detached WorkerW
-            struct ModernData {
-                workerw: HWND,
-                shell_view: HWND,
-            }
-            let mut md = ModernData {
-                workerw: HWND::default(),
-                shell_view: HWND::default(),
-            };
+            // Standard Win10/Win11 layout
+            struct ModernData { bg_worker: HWND, shell_view: HWND }
+            let mut md = ModernData { bg_worker: HWND::default(), shell_view: HWND::default() };
 
             unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
                 let d = &mut *(lp.0 as *mut ModernData);
-                if let Ok(s) = FindWindowExW(
-                    hwnd,
-                    HWND::default(),
-                    windows::core::w!("SHELLDLL_DefView"),
-                    None,
-                ) {
-                    if !s.is_invalid() {
-                        d.shell_view = s;
-                        if let Ok(w) = FindWindowExW(
-                            HWND::default(),
-                            hwnd,
-                            windows::core::w!("WorkerW"),
-                            None,
-                        ) {
-                            if !w.is_invalid() {
-                                d.workerw = w;
-                            }
-                        }
-                        return BOOL(0); // Found it, stop enumeration
-                    }
+                let s = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
+                if !s.is_invalid() {
+                    d.shell_view = s;
+                    let bg_w = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None).unwrap_or_default();
+                    if !bg_w.is_invalid() { d.bg_worker = bg_w; }
+                    return BOOL(0);
                 }
-                BOOL(1) // Continue enumeration
+                BOOL(1)
             }
-
             let _ = EnumWindows(Some(cb), LPARAM(&mut md as *mut _ as isize));
-            if !md.workerw.is_invalid() && !md.shell_view.is_invalid() {
+            if !md.bg_worker.is_invalid() && !md.shell_view.is_invalid() {
                 info!("[detect_desktop] Discovered Standard Win10/Win11 architecture on attempt {}", attempt);
-                target_parent = md.workerw;
+                target_parent = md.bg_worker;
                 shell_view = md.shell_view;
                 break;
             }
-
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
         if target_parent.is_invalid() {
-            error!("[detect_desktop] Failed to find target parent after 40 attempts.");
-            return Err("Desktop detection failed. Could not locate WorkerW/SHELLDLL_DefView hierarchy.".to_string());
+            return Err("Failed to locate WorkerW hierarchy.".to_string());
         }
 
-        debug!("[detect_desktop] Finding SysListView32 (Desktop Icons layer)...");
         let mut syslistview = HWND::default();
         unsafe extern "system" fn find_slv(hwnd: HWND, lp: LPARAM) -> BOOL {
             let mut buf = [0u16; 256];
@@ -210,36 +163,36 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             }
             BOOL(1)
         }
-        let _ = EnumChildWindows(
-            shell_view,
-            Some(find_slv),
-            LPARAM(&mut syslistview as *mut _ as isize),
-        );
+        let _ = EnumChildWindows(shell_view, Some(find_slv), LPARAM(&mut syslistview as *mut _ as isize));
 
         if syslistview.is_invalid() {
-            warn!("[detect_desktop] SysListView32 not found! Desktop icons will not be interactable.");
+            warn!("[detect_desktop] SysListView32 not found!");
         } else {
             info!("[detect_desktop] Found SysListView32 HWND: 0x{:X}", syslistview.0 as isize);
         }
 
-        debug!("[detect_desktop] Querying Virtual Screen metrics (Multi-Monitor support)...");
-        let v_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        let v_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        let v_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        let v_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        // Absolute Physical Bounds via EnumDisplayMonitors
+        struct MonitorRects { left: i32, top: i32, right: i32, bottom: i32 }
+        let mut m_rects = MonitorRects { left: 0, top: 0, right: 0, bottom: 0 };
+        unsafe extern "system" fn monitor_enum_cb(_hm: HMONITOR, _hdc: HDC, rect: *mut RECT, lp: LPARAM) -> BOOL {
+            let data = &mut *(lp.0 as *mut MonitorRects);
+            if rect.read().left < data.left { data.left = rect.read().left; }
+            if rect.read().top < data.top { data.top = rect.read().top; }
+            if rect.read().right > data.right { data.right = rect.read().right; }
+            if rect.read().bottom > data.bottom { data.bottom = rect.read().bottom; }
+            BOOL(1)
+        }
+        let _ = EnumDisplayMonitors(HDC::default(), None, Some(monitor_enum_cb), LPARAM(&mut m_rects as *mut _ as isize));
 
-        info!("[detect_desktop] Virtual Screen Metrics: Origin({}, {}), Size({}x{})", v_x, v_y, v_width, v_height);
+        info!("[detect_desktop] Physical Screen Bounds: ({},{}) -> ({},{}) = {}x{}",
+            m_rects.left, m_rects.top, m_rects.right, m_rects.bottom,
+            m_rects.right - m_rects.left, m_rects.bottom - m_rects.top);
 
         Ok(DesktopDetection {
-            is_24h2,
-            target_parent,
-            shell_view,
-            os_workerw,
-            syslistview,
-            v_x,
-            v_y,
-            v_width,
-            v_height,
+            is_24h2, target_parent, shell_view, os_workerw, syslistview,
+            v_x: m_rects.left, v_y: m_rects.top,
+            v_width: m_rects.right - m_rects.left,
+            v_height: m_rects.bottom - m_rects.top,
         })
     }
 }
@@ -253,74 +206,48 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    debug!("[apply_injection] Beginning window injection process for HWND 0x{:X}", our_hwnd.0 as isize);
-
     unsafe {
         let current_parent = GetParent(our_hwnd).unwrap_or_default();
-        if current_parent == detection.target_parent {
-            debug!("[apply_injection] Window is already injected into target parent. Skipping.");
-            return;
-        }
+        if current_parent == detection.target_parent { return; }
 
-        debug!("[apply_injection] Stripping standard window styles (THICKFRAME, CAPTION, SYSMENU)...");
         let mut style = GetWindowLongW(our_hwnd, GWL_STYLE) as u32;
-        style &= !(WS_THICKFRAME.0
-            | WS_CAPTION.0
-            | WS_SYSMENU.0
-            | WS_MAXIMIZEBOX.0
-            | WS_MINIMIZEBOX.0
-            | WS_POPUP.0);
+        style &= !(WS_THICKFRAME.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0 | WS_POPUP.0);
         style |= WS_CHILD.0 | WS_VISIBLE.0;
         let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style as i32);
 
-        debug!("[apply_injection] Applying WS_EX_NOACTIVATE...");
         let mut ex_style = GetWindowLongW(our_hwnd, GWL_EXSTYLE) as u32;
         ex_style |= WS_EX_NOACTIVATE.0;
         let _ = SetWindowLongW(our_hwnd, GWL_EXSTYLE, ex_style as i32);
 
-        debug!("[apply_injection] Calling SetParent...");
+        // Ensure WorkerW is visible before injecting
+        let _ = ShowWindow(detection.target_parent, SW_SHOW);
+
         let _ = SetParent(our_hwnd, detection.target_parent);
 
-        if detection.is_24h2 {
-            debug!("[apply_injection] Applying 24H2 specific Z-Order placement...");
-            let _ = SetWindowPos(
-                our_hwnd,
-                detection.shell_view,
-                0, 0, 0, 0,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE,
-            );
-            let _ = SetWindowPos(
-                detection.os_workerw,
-                our_hwnd,
-                0, 0, 0, 0,
-                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE,
-            );
-        } else {
-            debug!("[apply_injection] Applying standard Win10/11 Z-Order placement (HWND_BOTTOM)...");
-            let _ = SetWindowPos(
-                our_hwnd,
-                HWND_BOTTOM,
-                0, 0, 0, 0,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE,
-            );
-        }
+        // Standard Z-order placement (works for both 24H2 and Win10/11 now that we target WorkerW)
+        let _ = SetWindowPos(
+            our_hwnd,
+            HWND_BOTTOM,
+            0, 0, 0, 0,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE,
+        );
 
-        debug!("[apply_injection] Expanding window to cover Virtual Screen...");
         let _ = SetWindowPos(
             our_hwnd,
             HWND::default(),
-            detection.v_x,
-            detection.v_y,
-            detection.v_width,
-            detection.v_height,
+            detection.v_x, detection.v_y, detection.v_width, detection.v_height,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
+
+        // Force Chromium visual refresh to avoid black screen bug
+        let _ = ShowWindow(our_hwnd, SW_HIDE);
+        let _ = ShowWindow(our_hwnd, SW_SHOW);
 
         let final_parent = GetParent(our_hwnd).unwrap_or_default();
         let is_visible = IsWindowVisible(our_hwnd).as_bool();
 
         info!(
-            "[apply_injection] Injection Complete. State: Parent=0x{:X}, Visible={}, Rect=({}, {}, {}x{})",
+            "[apply_injection] Injection Complete. Parent=0x{:X}, Visible={}, Rect=({}, {}, {}x{})",
             final_parent.0 as isize, is_visible, detection.v_x, detection.v_y, detection.v_width, detection.v_height
         );
     }
