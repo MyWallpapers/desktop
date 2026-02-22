@@ -480,8 +480,9 @@ pub mod mouse_hook {
     /// Cursor is over the desktop area. Checks:
     /// 1. Direct hit on target_parent, SysListView32, or cached Chrome_RenderWidgetHostHWND
     /// 2. Child of target_parent (SHELLDLL_DefView, our Tauri Window, etc.)
-    /// 3. Child of WebView HWND (catches Chrome_RenderWidgetHostHWND in composition mode —
-    ///    it runs in a separate renderer process so PID check won't work)
+    /// 3. Child of WebView HWND
+    /// 4. Auto-discover Chrome_RenderWidgetHostHWND by class name (composition mode:
+    ///    it's a detached top-level window, not child of anything we own)
     #[inline]
     unsafe fn is_over_desktop(hwnd_under: HWND) -> bool {
         let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut _);
@@ -496,11 +497,27 @@ pub mod mouse_hook {
         if IsChild(tp, hwnd_under).as_bool() {
             return true;
         }
-        // Child of WebView HWND — catches Chrome_RenderWidgetHostHWND etc.
-        // (runs in Chromium renderer process, not our PID)
+        // Child of WebView HWND
         let wv = HWND(WEBVIEW_HWND.load(Ordering::Relaxed) as *mut _);
         if !wv.is_invalid() && IsChild(wv, hwnd_under).as_bool() {
             return true;
+        }
+        // Auto-discover Chrome_RenderWidgetHostHWND by class name.
+        // In composition mode it's a detached top-level window (different process,
+        // not a child of our HWND or Progman). Once found, cache for fast path.
+        if rwhh.is_invalid() {
+            let mut cls = [0u16; 40];
+            let len = GetClassNameW(hwnd_under, &mut cls) as usize;
+            // "Chrome_RenderWidgetHostHWND" = 31 chars — zero-alloc ASCII compare
+            if len == 31 {
+                const EXPECTED: &[u8] = b"Chrome_RenderWidgetHostHWND";
+                let matches = cls[..len].iter().zip(EXPECTED.iter()).all(|(&c, &e)| c == e as u16);
+                if matches {
+                    CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
+                    log::info!("[diag] Auto-discovered Chrome_RWHH=0x{:X}", hwnd_under.0 as isize);
+                    return true;
+                }
+            }
         }
         false
     }
