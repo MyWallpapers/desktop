@@ -73,16 +73,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            args: "--target aarch64-apple-darwin"
-            artifact: macos-aarch64
-          - platform: macos-latest
-            args: "--target x86_64-apple-darwin"
-            artifact: macos-x64
-          # Linux paused — re-enable when WebGPU support is resolved
-          # - platform: ubuntu-22.04
-          #   args: ""
-          #   artifact: linux
           - platform: windows-latest
             args: ""
             artifact: windows
@@ -95,8 +85,6 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -134,22 +122,10 @@ jobs:
         run: |
           mkdir -p artifacts
           find src-tauri/target -path "*/bundle/*" -type f \( \
-            -name "*.dmg" -o -name "*.exe" -o -name "*.msi" \
-            -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" \
+            -name "*.exe" -o -name "*.msi" \
             -o -name "*.msi.sig" -o -name "*.msi.zip" -o -name "*.msi.zip.sig" \
             -o -name "*.exe.sig" -o -name "*.nsis.zip" -o -name "*.nsis.zip.sig" \
           \) -exec cp {} artifacts/ \;
-
-          # Rename macOS .app.tar.gz to include arch (both builds produce identical filenames)
-          if [ "${{ matrix.artifact }}" = "macos-aarch64" ]; then
-            for f in artifacts/MyWallpaper.app.tar.gz*; do
-              [ -f "$f" ] && mv "$f" "${f/MyWallpaper.app/MyWallpaper_aarch64.app}"
-            done
-          elif [ "${{ matrix.artifact }}" = "macos-x64" ]; then
-            for f in artifacts/MyWallpaper.app.tar.gz*; do
-              [ -f "$f" ] && mv "$f" "${f/MyWallpaper.app/MyWallpaper_x64.app}"
-            done
-          fi
 
           echo "=== Collected ==="
           ls -la artifacts/
@@ -188,7 +164,7 @@ jobs:
           echo ""
 
           # Create release and upload all binaries + signatures
-          FILES=$(find . -type f \( -name "*.dmg" -o -name "*.exe" -o -name "*.msi" -o -name "*.app.tar.gz" -o -name "*.app.tar.gz.sig" -o -name "*.msi.sig" -o -name "*.msi.zip" -o -name "*.msi.zip.sig" -o -name "*.exe.sig" -o -name "*.nsis.zip" -o -name "*.nsis.zip.sig" \) | sort)
+          FILES=$(find . -type f \( -name "*.exe" -o -name "*.msi" -o -name "*.msi.sig" -o -name "*.msi.zip" -o -name "*.msi.zip.sig" -o -name "*.exe.sig" -o -name "*.nsis.zip" -o -name "*.nsis.zip.sig" \) | sort)
 
           if [ -z "$FILES" ]; then
             echo "::error::No release artifacts found"
@@ -215,8 +191,6 @@ jobs:
           for SIG_PATH in $SIG_FILES; do
             SIG_FILE=$(basename "$SIG_PATH")
             case "$SIG_FILE" in
-              *_aarch64.app.tar.gz.sig)   PLATFORM="darwin-aarch64" ;;
-              *_x64.app.tar.gz.sig)       PLATFORM="darwin-x86_64" ;;
               *_x64_en-US.msi.zip.sig)    PLATFORM="windows-x86_64" ;;
               *_x64-setup.nsis.zip.sig)   PLATFORM="windows-x86_64-nsis" ;;
               *) continue ;;
