@@ -280,6 +280,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         detection.parent_width, detection.parent_height,
         our_hwnd.0 as isize);
 
+    mouse_hook::set_our_pid(std::process::id());
     mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
     mouse_hook::set_target_parent_hwnd(detection.target_parent.0 as isize);
     if !detection.syslistview.is_invalid() {
@@ -291,17 +292,43 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     // State dump: window hierarchy, styles, positions, Z-order
     dump_state(our_hwnd, &detection);
 
+    // Dispatch window MUST be created before poll thread (it posts messages to it)
+    mouse_hook::init_dispatch_window();
+
     // WebView2 bounds — poll for controller, then marshal SetBounds to main thread
     let (w, h) = (detection.parent_width, detection.parent_height);
     std::thread::spawn(move || {
         use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, FindWindowExW};
         for _ in 0..60 {
             let ptr = wry::get_last_composition_controller_ptr();
             if ptr != 0 {
                 mouse_hook::set_comp_controller_ptr(ptr);
+                // Find Chrome_RenderWidgetHostHWND (WebView2 accessibility window)
+                let wv_hwnd = HWND(mouse_hook::get_webview_hwnd() as *mut _);
+                if !wv_hwnd.is_invalid() {
+                    unsafe {
+                        let rwhh = FindWindowExW(wv_hwnd, HWND::default(),
+                            windows::core::w!("Chrome_WidgetWin_0"), None).unwrap_or_default();
+                        // Chrome_RenderWidgetHostHWND is a child of Chrome_WidgetWin_0,
+                        // or directly a child of the webview HWND
+                        let target = if !rwhh.is_invalid() {
+                            FindWindowExW(rwhh, HWND::default(),
+                                windows::core::w!("Chrome_RenderWidgetHostHWND"), None).unwrap_or_default()
+                        } else {
+                            // Try direct child
+                            FindWindowExW(wv_hwnd, HWND::default(),
+                                windows::core::w!("Chrome_RenderWidgetHostHWND"), None).unwrap_or_default()
+                        };
+                        if !target.is_invalid() {
+                            mouse_hook::set_chrome_rwhh(target.0 as isize);
+                            log::info!("[diag] Chrome_RWHH=0x{:X}", target.0 as isize);
+                        } else {
+                            log::warn!("[diag] Chrome_RenderWidgetHostHWND not found, falling back to PID check");
+                        }
+                    }
+                }
                 log::info!("[diag] CompController=0x{:X}, requesting SetBounds {}x{} on main thread", ptr, w, h);
-                // Marshal SetBounds to main thread via dispatch window
                 let dh = mouse_hook::get_dispatch_hwnd();
                 if dh != 0 {
                     unsafe {
@@ -309,8 +336,6 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
                             mouse_hook::WM_MWP_SETBOUNDS_PUB,
                             WPARAM(w as usize), LPARAM(h as isize));
                     }
-                } else {
-                    log::error!("[diag] CompController ready but dispatch window not yet created");
                 }
                 return;
             }
@@ -319,7 +344,6 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
         log::warn!("CompositionController not found after 3s");
     });
 
-    mouse_hook::init_dispatch_window();
     mouse_hook::start_hook_thread();
     Ok(())
 }
@@ -355,6 +379,8 @@ pub mod mouse_hook {
     static COMP_CONTROLLER_PTR: AtomicIsize = AtomicIsize::new(0);
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
+    static OUR_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
 
     const STATE_IDLE: u8 = 0;
     const STATE_DRAGGING: u8 = 1;
@@ -376,6 +402,9 @@ pub mod mouse_hook {
     pub fn set_comp_controller_ptr(p: isize) { COMP_CONTROLLER_PTR.store(p, Ordering::SeqCst); }
     pub fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
     pub fn get_dispatch_hwnd() -> isize { DISPATCH_HWND.load(Ordering::SeqCst) }
+    pub fn set_our_pid(pid: u32) { OUR_PID.store(pid, Ordering::SeqCst); }
+    pub fn set_chrome_rwhh(h: isize) { CHROME_RWHH.store(h, Ordering::SeqCst); }
+    pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
     pub const WM_MWP_SETBOUNDS_PUB: u32 = WM_MWP_SETBOUNDS;
 
     static DIAG_POST_FAIL: AtomicBool = AtomicBool::new(true);
@@ -451,21 +480,29 @@ pub mod mouse_hook {
     }
 
     /// Cursor is over the desktop area. Checks:
-    /// 1. Direct hit on target_parent (Progman/WorkerW) or SysListView32
+    /// 1. Direct hit on target_parent, SysListView32, or Chrome_RenderWidgetHostHWND
     /// 2. Child of target_parent (SHELLDLL_DefView, our Tauri Window, etc.)
-    /// 3. Same-process window (WebView2's Chrome_RenderWidgetHostHWND sits
-    ///    outside the HWND hierarchy in composition mode)
+    /// 3. Fallback: same-process PID (catches any other WebView2 internal window)
     #[inline]
     unsafe fn is_over_desktop(hwnd_under: HWND) -> bool {
         let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut _);
         let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
-        if hwnd_under == tp || hwnd_under == slv || IsChild(tp, hwnd_under).as_bool() {
+        let rwhh = HWND(CHROME_RWHH.load(Ordering::Relaxed) as *mut _);
+        // Fast path: direct HWND comparison (most common cases)
+        if hwnd_under == tp || hwnd_under == slv
+            || (!rwhh.is_invalid() && hwnd_under == rwhh) {
             return true;
         }
-        // Composition mode: Chrome_RenderWidgetHostHWND is detached from Progman tree
+        // HWND tree walk
+        if IsChild(tp, hwnd_under).as_bool() {
+            return true;
+        }
+        // Fallback: PID check for any other detached WebView2 windows
+        let our_pid = OUR_PID.load(Ordering::Relaxed);
+        if our_pid == 0 { return false; }
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd_under, Some(&mut pid));
-        pid != 0 && pid == std::process::id()
+        pid == our_pid
     }
 
     #[inline]
