@@ -146,7 +146,7 @@ fn start_with_tauri_webview() {
     app.run(|_app_handle, event| {
         if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
             info!("[app.run] Exit requested. Ensuring desktop icons are restored.");
-            window_layer::restore_desktop_icons();
+            window_layer::restore_desktop_icons_and_unhook();
         }
     });
 }

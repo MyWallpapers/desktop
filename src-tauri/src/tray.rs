@@ -36,7 +36,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 info!("[tray] Quit triggered from tray context menu.");
 
                 // SAFETY: Restore icons across OS before quitting.
-                crate::window_layer::restore_desktop_icons();
+                crate::window_layer::restore_desktop_icons_and_unhook();
 
                 app.exit(0);
             }
