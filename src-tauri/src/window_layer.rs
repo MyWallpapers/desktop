@@ -340,6 +340,20 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
     apply_injection(our_hwnd, &detection);
 
+    // Diagnostic: log main HWND client rect after injection
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        use windows::Win32::Foundation::RECT;
+        let mut wr = RECT::default();
+        let mut cr = RECT::default();
+        let _ = GetWindowRect(our_hwnd, &mut wr);
+        let _ = GetClientRect(our_hwnd, &mut cr);
+        info!("[border-diag] main HWND=0x{:X} window=({},{},{},{}) client=({},{},{},{})",
+            our_hwnd.0 as isize,
+            wr.left, wr.top, wr.right, wr.bottom,
+            cr.left, cr.top, cr.right, cr.bottom);
+    }
+
     // Force-reposition all direct child windows of our HWND to (0, 0, full_w, full_h).
     // The wry container HWND ("WRY_WEBVIEW") was sized at creation time when WS_THICKFRAME
     // was still present, so its dimensions are smaller than the full desktop by ~14px.
@@ -347,16 +361,28 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     // eliminating left/top border artifacts.
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::*;
+        use windows::Win32::Foundation::RECT;
         let w = detection.parent_width;
         let h = detection.parent_height;
+        let mut n = 0u32;
         let mut child = FindWindowExW(our_hwnd, HWND::default(), None, None)
             .unwrap_or(HWND::default());
         while !child.is_invalid() {
+            let mut before = RECT::default();
+            let _ = GetWindowRect(child, &mut before);
             let _ = SetWindowPos(child, None, 0, 0, w, h,
                 SWP_NOACTIVATE | SWP_NOZORDER);
+            let mut after = RECT::default();
+            let _ = GetWindowRect(child, &mut after);
+            info!("[border-diag] child[{}]=0x{:X} before=({},{},{},{}) after=({},{},{},{})",
+                n, child.0 as isize,
+                before.left, before.top, before.right, before.bottom,
+                after.left, after.top, after.right, after.bottom);
+            n += 1;
             child = FindWindowExW(our_hwnd, child, None, None)
                 .unwrap_or(HWND::default());
         }
+        info!("[border-diag] repositioned {} direct children to (0,0,{},{})", n, w, h);
     }
 
     // Extract composition controller from wry (stored during WebView2 creation)

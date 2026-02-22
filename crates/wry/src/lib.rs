@@ -2390,7 +2390,30 @@ pub unsafe fn set_controller_bounds_raw(
   let controller: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller =
     comp.cast().map_err(|e| format!("QI for ICoreWebView2Controller failed: {}", e))?;
 
-  // 1. Update WebView2 rendering bounds
+  // 1. Reposition the container HWND FIRST (wry creates this as a child of the main window).
+  //    After style stripping (WS_THICKFRAME removed), the container may still be at
+  //    its creation-time size (smaller than the full desktop).
+  use windows::Win32::Foundation::HWND;
+  use windows::Win32::UI::WindowsAndMessaging::*;
+  let mut container = HWND::default();
+  if controller.ParentWindow(&mut container).is_ok() && !container.is_invalid() {
+    // Log container state before repositioning
+    let mut before_rect = RECT::default();
+    let _ = GetWindowRect(container, &mut before_rect);
+    let mut before_client = RECT::default();
+    let _ = GetClientRect(container, &mut before_client);
+    log::info!("[wv2-bounds] container=0x{:X} before: window=({},{},{},{}) client=({},{},{},{})",
+      container.0 as isize,
+      before_rect.left, before_rect.top, before_rect.right, before_rect.bottom,
+      before_client.left, before_client.top, before_client.right, before_client.bottom);
+
+    let _ = SetWindowPos(
+      container, None, 0, 0, width, height,
+      SWP_NOACTIVATE | SWP_NOZORDER,
+    );
+  }
+
+  // 2. Update WebView2 rendering bounds
   controller.SetBounds(RECT {
     left: 0,
     top: 0,
@@ -2398,19 +2421,10 @@ pub unsafe fn set_controller_bounds_raw(
     bottom: height,
   }).map_err(|e| format!("SetBounds failed: {}", e))?;
 
-  // 2. Reposition the container HWND (wry creates this as a child of the main window).
-  //    After style stripping (WS_THICKFRAME removed), the container may still be at
-  //    the old offset. This mirrors what wry's WM_SIZE handler does.
-  //    IMPORTANT: no SWP_ASYNCWINDOWPOS — must be synchronous to take effect immediately.
-  use windows::Win32::Foundation::HWND;
-  use windows::Win32::UI::WindowsAndMessaging::*;
-  let mut container = HWND::default();
-  if controller.ParentWindow(&mut container).is_ok() && !container.is_invalid() {
-    let _ = SetWindowPos(
-      container, None, 0, 0, width, height,
-      SWP_NOACTIVATE | SWP_NOZORDER,
-    );
-  }
+  // 3. Notify WebView2 that the parent window position changed.
+  //    Per Microsoft docs, this is required for correct accessibility and dialog positioning
+  //    after window moves/resizes.
+  let _ = controller.NotifyParentWindowPositionChanged();
 
   Ok(())
 }
