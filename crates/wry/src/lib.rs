@@ -2397,16 +2397,6 @@ pub unsafe fn set_controller_bounds_raw(
   use windows::Win32::UI::WindowsAndMessaging::*;
   let mut container = HWND::default();
   if controller.ParentWindow(&mut container).is_ok() && !container.is_invalid() {
-    // Log container state before repositioning
-    let mut before_rect = RECT::default();
-    let _ = GetWindowRect(container, &mut before_rect);
-    let mut before_client = RECT::default();
-    let _ = GetClientRect(container, &mut before_client);
-    log::info!("[wv2-bounds] container=0x{:X} before: window=({},{},{},{}) client=({},{},{},{})",
-      container.0 as isize,
-      before_rect.left, before_rect.top, before_rect.right, before_rect.bottom,
-      before_client.left, before_client.top, before_client.right, before_client.bottom);
-
     let _ = SetWindowPos(
       container, None, 0, 0, width, height,
       SWP_NOACTIVATE | SWP_NOZORDER,
