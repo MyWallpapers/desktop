@@ -6,9 +6,10 @@
 
 #[cfg(target_os = "windows")]
 use log::{debug, error, info, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
+pub static HOOK_HANDLE_GLOBAL: AtomicIsize = AtomicIsize::new(0);
 
 // ============================================================================
 // Public API
@@ -50,12 +51,12 @@ pub fn set_desktop_icons_visible(_visible: bool) -> Result<(), String> {
 }
 
 pub fn restore_desktop_icons() {
-    if ICONS_RESTORED.swap(true, Ordering::SeqCst) {
-        debug!("[window_layer] restore_desktop_icons called, but already restored.");
-        return;
-    }
     #[cfg(target_os = "windows")]
     {
+        if ICONS_RESTORED.swap(true, Ordering::SeqCst) {
+            debug!("[window_layer] restore_desktop_icons called, but already restored.");
+            return;
+        }
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
         let slv = mouse_hook::get_syslistview_hwnd();
@@ -67,6 +68,8 @@ pub fn restore_desktop_icons() {
             info!("[window_layer] Desktop icons successfully restored on exit.");
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = ICONS_RESTORED.swap(true, Ordering::SeqCst);
 }
 
 // ============================================================================
@@ -398,12 +401,12 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 }
 
 // ============================================================================
-// Windows: Mouse Hook
+// Windows: Mouse Hook (WITH SMART LOGGING)
 // ============================================================================
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use log::{debug, error, info};
+    use log::{debug, error, info, warn};
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
@@ -430,13 +433,15 @@ pub mod mouse_hook {
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
-    static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
     const STATE_IDLE: u8 = 0;
     const STATE_DRAGGING: u8 = 1;
     const STATE_NATIVE: u8 = 2;
     static HOOK_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 
+    // --- SMART LOGGING TRACKERS ---
+    static LAST_HWND_UNDER: AtomicIsize = AtomicIsize::new(0);
+    static LAST_ICON_STATE: AtomicBool = AtomicBool::new(false);
     static DIAG_POST_FAIL: AtomicBool = AtomicBool::new(true);
 
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -489,8 +494,13 @@ pub mod mouse_hook {
             let ptr = get_comp_controller_ptr();
 
             if ptr != 0 {
+                let is_move = kind == MOUSE_MOVE;
                 if let Err(e) = wry::send_mouse_input_raw(ptr, kind, vk, data, x, y) {
                     error!("[dispatch_wnd_proc] WRY send_mouse_input_raw FAILED: {}", e);
+                } else if !is_move {
+                    // On ne loggue que les clics et molettes pour éviter le spam,
+                    // mais cela confirme que l'envoi vers WebView2 est un succès !
+                    debug!("[dispatch_wnd_proc] Wry Dispatch Success -> Kind: 0x{:X}, VK: {}, Pos: ({},{})", kind, vk, x, y);
                 }
             }
             return LRESULT(0);
@@ -652,7 +662,7 @@ pub mod mouse_hook {
             }
 
             unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-                let hook_h = HHOOK(HOOK_HANDLE.load(Ordering::Relaxed) as *mut _);
+                let hook_h = HHOOK(crate::window_layer::HOOK_HANDLE_GLOBAL.load(Ordering::Relaxed) as *mut _);
 
                 if code < 0 {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
@@ -668,12 +678,44 @@ pub mod mouse_hook {
                 let wv = HWND(wv_raw as *mut _);
                 let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
                 let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
+
+                // ==========================================================
+                // SMART LOGGING : DÉTECTION DES CHANGEMENTS DE FENÊTRE
+                // ==========================================================
+                let hwnd_under = WindowFromPoint(info.pt);
+                let prev_hwnd = LAST_HWND_UNDER.swap(hwnd_under.0 as isize, Ordering::Relaxed);
+
+                if prev_hwnd != hwnd_under.0 as isize {
+                    let mut cls = [0u16; 64];
+                    let len = GetClassNameW(hwnd_under, &mut cls);
+                    let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
+                    debug!("[hook_proc] [SMART LOG] Mouse crossed boundary -> HWND: 0x{:X} (Class: '{}')", hwnd_under.0 as isize, cls_name);
+                }
+
+                if !is_over_desktop(hwnd_under) {
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
+
+                // ==========================================================
+                // SMART LOGGING : DÉTECTION DES SURVOLS D'ICÔNES DE BUREAU
+                // ==========================================================
+                let is_icon = is_mouse_over_desktop_icon(info.pt.x, info.pt.y);
+                let prev_icon = LAST_ICON_STATE.swap(is_icon, Ordering::Relaxed);
+
+                if is_icon != prev_icon {
+                    if is_icon {
+                        debug!("[hook_proc] [SMART LOG] Hovering Desktop Icon. Interactions will be Native.");
+                    } else {
+                        debug!("[hook_proc] [SMART LOG] Left Desktop Icon. Interactions will be WebView.");
+                    }
+                }
+
                 let state = HOOK_STATE.load(Ordering::Relaxed);
 
                 // STATE_NATIVE (Interacting with a real Desktop Icon)
                 if state == STATE_NATIVE {
                     if is_up {
-                        debug!("[hook_proc] Mouse UP received. Transitioning from NATIVE to IDLE.");
+                        debug!("[hook_proc] [STATE] Mouse UP received. Transition: NATIVE -> IDLE.");
                         HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
                     }
                     return CallNextHookEx(hook_h, code, wparam, lparam);
@@ -686,7 +728,7 @@ pub mod mouse_hook {
                     let _ = ScreenToClient(wv, &mut cp);
                     forward(msg, &info, cp.x, cp.y);
                     if is_up {
-                        debug!("[hook_proc] Mouse UP received. Transitioning from DRAGGING to IDLE.");
+                        debug!("[hook_proc] [STATE] Mouse UP received. Transition: DRAGGING -> IDLE.");
                         HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
                     }
                     if msg == WM_MOUSEMOVE {
@@ -695,20 +737,14 @@ pub mod mouse_hook {
                     return LRESULT(1);
                 }
 
-                // STATE_IDLE
-                let hwnd_under = WindowFromPoint(info.pt);
-                if !is_over_desktop(hwnd_under) {
-                    return CallNextHookEx(hook_h, code, wparam, lparam);
-                }
-
-                // Evaluate Desktop Icon Intersection
+                // Evaluate Desktop Icon Intersection on Clicks
                 if is_down {
-                    if is_mouse_over_desktop_icon(info.pt.x, info.pt.y) {
-                        debug!("[hook_proc] Icon HitTest TRUE at {},{}. Transitioning IDLE -> NATIVE", info.pt.x, info.pt.y);
+                    if is_icon {
+                        debug!("[hook_proc] [STATE] Clicked Icon at {},{}. Transition: IDLE -> NATIVE", info.pt.x, info.pt.y);
                         HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
                         return CallNextHookEx(hook_h, code, wparam, lparam);
                     }
-                    debug!("[hook_proc] Icon HitTest FALSE at {},{}. Transitioning IDLE -> DRAGGING", info.pt.x, info.pt.y);
+                    debug!("[hook_proc] [STATE] Clicked WebView at {},{}. Transition: IDLE -> DRAGGING", info.pt.x, info.pt.y);
                     HOOK_STATE.store(STATE_DRAGGING, Ordering::Relaxed);
                 }
 
@@ -719,7 +755,6 @@ pub mod mouse_hook {
 
                 forward(msg, &info, cp.x, cp.y);
 
-                // Allow mouse visual to move, but block programmatic click propagation
                 if msg == WM_MOUSEMOVE {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
@@ -731,21 +766,19 @@ pub mod mouse_hook {
                 let hook_result = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0);
                 match &hook_result {
                     Ok(h) => {
-                        HOOK_HANDLE.store(h.0 as isize, Ordering::SeqCst);
+                        crate::window_layer::HOOK_HANDLE_GLOBAL.store(h.0 as isize, Ordering::SeqCst);
                         info!("[start_hook_thread] WH_MOUSE_LL Hook installed successfully: 0x{:X}", h.0 as isize);
                     }
                     Err(e) => {
-                        error!("[start_hook_thread] WH_MOUSE_LL Hook FAILED: {}", e);
+                        error!("[start_hook_thread] CRITICAL: WH_MOUSE_LL Hook FAILED: {}", e);
                     }
                 }
 
-                debug!("[start_hook_thread] Entering message loop for hook thread.");
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
-                warn!("[start_hook_thread] Message loop exited unexpectedly.");
             }
         });
     }
