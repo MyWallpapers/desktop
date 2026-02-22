@@ -198,6 +198,15 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     let our_hwnd = HWND(our_hwnd.0 as *mut _);
     let detection = detect_desktop()?;
 
+    info!("[diag] detection: mode={} tp=0x{:X} sv=0x{:X} ww=0x{:X} slv=0x{:X} size={}x{} ourHwnd=0x{:X}",
+        if detection.is_24h2 { "24H2" } else { "Legacy" },
+        detection.target_parent.0 as isize,
+        detection.shell_view.0 as isize,
+        detection.os_workerw.0 as isize,
+        detection.syslistview.0 as isize,
+        detection.parent_width, detection.parent_height,
+        our_hwnd.0 as isize);
+
     mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
     mouse_hook::set_target_parent_hwnd(detection.target_parent.0 as isize);
     if !detection.syslistview.is_invalid() {
@@ -263,9 +272,11 @@ pub mod mouse_hook {
     const STATE_DRAGGING: u8 = 1;
     static HOOK_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 
-    // Diagnostic: log first events at each stage
+    // Diagnostic: log first N events at each stage
     static DIAG_HOOK: AtomicBool = AtomicBool::new(true);
     static DIAG_DISPATCH: AtomicBool = AtomicBool::new(true);
+    static DIAG_MISS_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static DIAG_MISS_LOGGED: AtomicBool = AtomicBool::new(false);
 
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
 
@@ -294,9 +305,15 @@ pub mod mouse_hook {
             let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
             let ptr = get_comp_controller_ptr();
             if DIAG_DISPATCH.swap(false, Ordering::Relaxed) {
-                log::info!("[diag] dispatch: kind=0x{:X} x={} y={} ptr=0x{:X}", kind, x, y, ptr);
+                log::info!("[diag] dispatch: kind=0x{:X} vk=0x{:X} data={} x={} y={} ptr=0x{:X}", kind, vk, data, x, y, ptr);
             }
-            if ptr != 0 { let _ = wry::send_mouse_input_raw(ptr, kind, vk, data, x, y); }
+            if ptr != 0 {
+                if let Err(e) = wry::send_mouse_input_raw(ptr, kind, vk, data, x, y) {
+                    log::error!("[diag] SendMouseInput FAILED: {} kind=0x{:X} x={} y={}", e, kind, x, y);
+                }
+            } else {
+                log::error!("[diag] dispatch: ptr=0, no CompController — dropping event");
+            }
             return LRESULT(0);
         }
         DefWindowProcW(hwnd, msg, wp, lp)
@@ -307,10 +324,16 @@ pub mod mouse_hook {
             let cls = windows::core::w!("MWP_MouseDispatch");
             let wc = WNDCLASSW { lpfnWndProc: Some(dispatch_wnd_proc), lpszClassName: cls, ..Default::default() };
             let _ = RegisterClassW(&wc);
-            if let Ok(h) = CreateWindowExW(WINDOW_EX_STYLE(0), cls, windows::core::w!(""),
+            match CreateWindowExW(WINDOW_EX_STYLE(0), cls, windows::core::w!(""),
                 WINDOW_STYLE(0), 0, 0, 0, 0, HWND_MESSAGE, None, None, None)
             {
-                DISPATCH_HWND.store(h.0 as isize, Ordering::SeqCst);
+                Ok(h) => {
+                    DISPATCH_HWND.store(h.0 as isize, Ordering::SeqCst);
+                    log::info!("[diag] dispatch window=0x{:X}", h.0 as isize);
+                }
+                Err(e) => {
+                    log::error!("[diag] dispatch window FAILED: {}", e);
+                }
             }
         }
     }
@@ -377,6 +400,24 @@ pub mod mouse_hook {
                 // IDLE: check if over desktop
                 let hwnd_under = WindowFromPoint(info.pt);
                 if !is_over_desktop(hwnd_under) {
+                    // Log first 3 misses so we know what HWND is blocking
+                    if !DIAG_MISS_LOGGED.load(Ordering::Relaxed) {
+                        let count = DIAG_MISS_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if count < 3 {
+                            let tp = TARGET_PARENT_HWND.load(Ordering::Relaxed);
+                            let slv = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
+                            let wv = WEBVIEW_HWND.load(Ordering::Relaxed);
+                            let mut cls = [0u16; 64];
+                            let len = GetClassNameW(hwnd_under, &mut cls);
+                            let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
+                            log::warn!("[diag] MISS {}/3: under=0x{:X} class='{}' pt=({},{}) tp=0x{:X} slv=0x{:X} wv=0x{:X} isChild={}",
+                                count+1, hwnd_under.0 as isize, cls_name, info.pt.x, info.pt.y,
+                                tp, slv, wv,
+                                IsChild(HWND(tp as *mut _), hwnd_under).as_bool());
+                        } else {
+                            DIAG_MISS_LOGGED.store(true, Ordering::Relaxed);
+                        }
+                    }
                     return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                 }
 
@@ -397,7 +438,12 @@ pub mod mouse_hook {
             }
 
             unsafe {
-                let _h = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0);
+                let hook_result = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0);
+                match &hook_result {
+                    Ok(h) => log::info!("[diag] hook installed=0x{:X}", h.0 as isize),
+                    Err(e) => log::error!("[diag] hook FAILED: {}", e),
+                }
+                let _h = hook_result;
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
                     let _ = TranslateMessage(&msg);
