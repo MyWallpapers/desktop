@@ -7,7 +7,7 @@ mod commands_core;
 mod tray;
 mod window_layer;
 
-use log::info;
+use log::{debug, error, info};
 
 fn mw_init_script() -> String {
     format!(
@@ -43,13 +43,17 @@ pub fn main() {
         }
     }
 
-    info!("Starting MyWallpaper Desktop v{}", env!("CARGO_PKG_VERSION"));
+    info!("[main] Starting MyWallpaper Desktop v{}", env!("CARGO_PKG_VERSION"));
+    info!("[main] OS: {}, Architecture: {}", std::env::consts::OS, std::env::consts::ARCH);
+
     start_with_tauri_webview();
 }
 
 fn start_with_tauri_webview() {
     use tauri::webview::PageLoadEvent;
     use tauri::{Emitter, Listener, Manager};
+
+    debug!("[start_with_tauri_webview] Building Tauri application instance...");
 
     let app = tauri::Builder::default()
         .plugin(
@@ -67,9 +71,11 @@ fn start_with_tauri_webview() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            debug!("[plugin_single_instance] Single instance callback triggered with args: {:?}", args);
             for arg in args.iter() {
                 if arg.starts_with("mywallpaper://") {
                     if let Some(window) = app.get_webview_window("main") {
+                        info!("[plugin_single_instance] Emitting deep-link event to frontend.");
                         let _ = window.emit("deep-link", arg.clone());
                     }
                 }
@@ -77,49 +83,50 @@ fn start_with_tauri_webview() {
         }))
         .on_page_load(|webview, payload| {
             if payload.event() == PageLoadEvent::Started {
+                debug!("[on_page_load] Page load started. Injecting mw_init_script...");
                 let _ = webview.eval(&mw_init_script());
             }
         })
         .setup(|app| {
-            info!("Application setup starting...");
+            info!("[setup] Tauri Application setup phase starting...");
             let handle = app.handle().clone();
 
+            debug!("[setup] Initializing System Tray...");
             if let Err(e) = tray::setup_tray(&handle) {
-                log::error!("Failed to setup system tray: {}", e);
+                error!("[setup] Failed to setup system tray: {}", e);
             }
 
+            debug!("[setup] Registering Deep Link listeners...");
             let deep_link_handle = handle.clone();
             app.listen("deep-link://new-url", move |event| {
+                debug!("[deep-link] Received raw deep link payload: {}", event.payload());
                 if let Ok(urls) = serde_json::from_str::<Vec<String>>(event.payload()) {
                     for url in urls.into_iter().filter(|u| u.starts_with("mywallpaper://")) {
+                        info!("[deep-link] Routing URL to main window: {}", url);
                         if let Some(window) = deep_link_handle.get_webview_window("main") {
                             let _ = window.emit("deep-link", url);
-                            let _ = window.set_focus();
                         }
                     }
+                } else {
+                    error!("[deep-link] Failed to parse deep-link payload as JSON array.");
                 }
             });
 
+            debug!("[setup] Configuring main window parameters...");
             if let Some(window) = app.get_webview_window("main") {
                 use tauri::webview::Color;
                 let _ = window.set_background_color(Some(Color(0, 0, 0, 255)));
                 let _ = window.set_decorations(false);
-
-                if let Some(monitor) = window.primary_monitor().ok().flatten() {
-                    let size = monitor.size();
-                    let position = monitor.position();
-                    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(position.x, position.y)));
-                    let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(size.width, size.height)));
-                }
-
                 let _ = window.show();
+                debug!("[setup] Main window shown. Firing Desktop Subsystem Injection...");
 
-                // Lancement de l'architecture universelle (Derrière les icônes)
+                // Fire Desktop Subsystem
                 window_layer::setup_desktop_window(&window);
-                
+            } else {
+                error!("[setup] CRITICAL: Main webview window not found during setup phase.");
             }
 
-            info!("Application setup complete");
+            info!("[setup] Application setup phase complete.");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -129,14 +136,15 @@ fn start_with_tauri_webview() {
             commands::restart_app,
             commands::open_oauth_in_browser,
             commands::reload_window,
-            window_layer::set_desktop_icons_visible, 
+            window_layer::set_desktop_icons_visible,
         ])
         .build(tauri::generate_context!())
         .expect("Error while building MyWallpaper Desktop");
 
-    // Lancement de l'application avec sécurité de restauration des icônes
+    debug!("[start_with_tauri_webview] Entering main event loop...");
     app.run(|_app_handle, event| {
         if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+            info!("[app.run] Exit requested. Ensuring desktop icons are restored.");
             window_layer::restore_desktop_icons();
         }
     });

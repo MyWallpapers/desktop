@@ -5,7 +5,7 @@
 //! SendMouseInput (composition mode).
 
 #[cfg(target_os = "windows")]
-use log::{info, warn};
+use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
@@ -16,44 +16,61 @@ static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
 
 pub fn setup_desktop_window(_window: &tauri::WebviewWindow) {
     #[cfg(target_os = "windows")]
-    let window = _window;
-    #[cfg(target_os = "windows")]
-    if let Err(e) = ensure_in_worker_w(window) {
-        warn!("Failed to setup desktop layer: {}", e);
+    {
+        info!("[window_layer] Starting desktop window setup...");
+        if let Err(e) = ensure_in_worker_w(_window) {
+            error!("[window_layer] CRITICAL: Failed to setup desktop layer: {}", e);
+        } else {
+            info!("[window_layer] Desktop layer setup completed successfully.");
+        }
     }
 }
 
 #[tauri::command]
 pub fn set_desktop_icons_visible(_visible: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    let visible = _visible;
-    #[cfg(target_os = "windows")]
     {
-        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
         use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
         let slv = mouse_hook::get_syslistview_hwnd();
+        debug!("[window_layer] set_desktop_icons_visible requested: visible={}, slv=0x{:X}", _visible, slv);
         if slv != 0 {
-            unsafe { let _ = ShowWindow(HWND(slv as *mut _), if visible { SW_SHOW } else { SW_HIDE }); }
+            unsafe {
+                let _ = ShowWindow(
+                    HWND(slv as *mut _),
+                    if _visible { SW_SHOW } else { SW_HIDE },
+                );
+            }
+            info!("[window_layer] Desktop icons visibility set to {}", _visible);
+        } else {
+            warn!("[window_layer] Cannot change icon visibility: SysListView32 HWND is 0");
         }
     }
     Ok(())
 }
 
 pub fn restore_desktop_icons() {
-    if ICONS_RESTORED.swap(true, Ordering::SeqCst) { return; }
+    if ICONS_RESTORED.swap(true, Ordering::SeqCst) {
+        debug!("[window_layer] restore_desktop_icons called, but already restored.");
+        return;
+    }
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
         use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
         let slv = mouse_hook::get_syslistview_hwnd();
+        debug!("[window_layer] Executing safety restore of desktop icons. slv=0x{:X}", slv);
         if slv != 0 {
-            unsafe { let _ = ShowWindow(HWND(slv as *mut _), SW_SHOW); }
+            unsafe {
+                let _ = ShowWindow(HWND(slv as *mut _), SW_SHOW);
+            }
+            info!("[window_layer] Desktop icons successfully restored on exit.");
         }
     }
 }
 
 // ============================================================================
-// Windows: Desktop Detection
+// Windows: Desktop Detection (Modern Win10/Win11)
 // ============================================================================
 
 #[cfg(target_os = "windows")]
@@ -63,8 +80,10 @@ struct DesktopDetection {
     shell_view: windows::Win32::Foundation::HWND,
     os_workerw: windows::Win32::Foundation::HWND,
     syslistview: windows::Win32::Foundation::HWND,
-    parent_width: i32,
-    parent_height: i32,
+    v_x: i32,
+    v_y: i32,
+    v_width: i32,
+    v_height: i32,
 }
 
 #[cfg(target_os = "windows")]
@@ -72,23 +91,52 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
+    debug!("[detect_desktop] Initiating desktop window detection...");
+
     unsafe {
         let progman = FindWindowW(windows::core::w!("Progman"), None)
-            .map_err(|_| "Could not find Progman".to_string())?;
+            .map_err(|_| "Could not find Progman. Explorer might be crashed.".to_string())?;
 
+        info!("[detect_desktop] Found Progman HWND: 0x{:X}", progman.0 as isize);
+
+        // Send message to spawn WorkerW if it doesn't exist
+        debug!("[detect_desktop] Sending 0x052C message to Progman to trigger WorkerW spawn...");
         let mut msg_result: usize = 0;
-        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
+        let _ = SendMessageTimeoutW(
+            progman,
+            0x052C,
+            WPARAM(0x0D),
+            LPARAM(1),
+            SMTO_NORMAL,
+            1000,
+            Some(&mut msg_result),
+        );
+        debug!("[detect_desktop] 0x052C message sent. Result: {}", msg_result);
 
         let mut is_24h2 = false;
         let mut target_parent = HWND::default();
         let mut shell_view = HWND::default();
         let mut os_workerw = HWND::default();
 
-        for _ in 0..40 {
-            // 24H2+: SHELLDLL_DefView and WorkerW both inside Progman
-            let sv = FindWindowExW(progman, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None).unwrap_or_default();
-            let ww = FindWindowExW(progman, HWND::default(), windows::core::w!("WorkerW"), None).unwrap_or_default();
+        debug!("[detect_desktop] Polling for hierarchy resolution (max 40 attempts)...");
+        for attempt in 1..=40 {
+            // Check for Windows 11 24H2+ layout: SHELLDLL_DefView inside Progman
+            let sv = FindWindowExW(
+                progman,
+                HWND::default(),
+                windows::core::w!("SHELLDLL_DefView"),
+                None,
+            ).unwrap_or_default();
+
+            let ww = FindWindowExW(
+                progman,
+                HWND::default(),
+                windows::core::w!("WorkerW"),
+                None,
+            ).unwrap_or_default();
+
             if !sv.is_invalid() && !ww.is_invalid() {
+                info!("[detect_desktop] Discovered Windows 11 24H2+ architecture on attempt {}", attempt);
                 is_24h2 = true;
                 target_parent = progman;
                 shell_view = sv;
@@ -96,26 +144,47 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
                 break;
             }
 
-            // Legacy: SHELLDLL_DefView inside a top-level WorkerW
-            struct LegacyData { workerw: HWND, shell_view: HWND }
-            let mut ld = LegacyData { workerw: HWND::default(), shell_view: HWND::default() };
+            // Check for Standard Windows 10 / Windows 11 layout: SHELLDLL_DefView inside detached WorkerW
+            struct ModernData {
+                workerw: HWND,
+                shell_view: HWND,
+            }
+            let mut md = ModernData {
+                workerw: HWND::default(),
+                shell_view: HWND::default(),
+            };
+
             unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
-                let d = &mut *(lp.0 as *mut LegacyData);
-                if let Ok(s) = FindWindowExW(hwnd, HWND::default(), windows::core::w!("SHELLDLL_DefView"), None) {
+                let d = &mut *(lp.0 as *mut ModernData);
+                if let Ok(s) = FindWindowExW(
+                    hwnd,
+                    HWND::default(),
+                    windows::core::w!("SHELLDLL_DefView"),
+                    None,
+                ) {
                     if !s.is_invalid() {
                         d.shell_view = s;
-                        if let Ok(w) = FindWindowExW(HWND::default(), hwnd, windows::core::w!("WorkerW"), None) {
-                            if !w.is_invalid() { d.workerw = w; }
+                        if let Ok(w) = FindWindowExW(
+                            HWND::default(),
+                            hwnd,
+                            windows::core::w!("WorkerW"),
+                            None,
+                        ) {
+                            if !w.is_invalid() {
+                                d.workerw = w;
+                            }
                         }
-                        return BOOL(0);
+                        return BOOL(0); // Found it, stop enumeration
                     }
                 }
-                BOOL(1)
+                BOOL(1) // Continue enumeration
             }
-            let _ = EnumWindows(Some(cb), LPARAM(&mut ld as *mut _ as isize));
-            if !ld.workerw.is_invalid() && !ld.shell_view.is_invalid() {
-                target_parent = ld.workerw;
-                shell_view = ld.shell_view;
+
+            let _ = EnumWindows(Some(cb), LPARAM(&mut md as *mut _ as isize));
+            if !md.workerw.is_invalid() && !md.shell_view.is_invalid() {
+                info!("[detect_desktop] Discovered Standard Win10/Win11 architecture on attempt {}", attempt);
+                target_parent = md.workerw;
+                shell_view = md.shell_view;
                 break;
             }
 
@@ -123,10 +192,11 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
         }
 
         if target_parent.is_invalid() {
-            return Err("Desktop detection failed".to_string());
+            error!("[detect_desktop] Failed to find target parent after 40 attempts.");
+            return Err("Desktop detection failed. Could not locate WorkerW/SHELLDLL_DefView hierarchy.".to_string());
         }
 
-        // Find SysListView32
+        debug!("[detect_desktop] Finding SysListView32 (Desktop Icons layer)...");
         let mut syslistview = HWND::default();
         unsafe extern "system" fn find_slv(hwnd: HWND, lp: LPARAM) -> BOOL {
             let mut buf = [0u16; 256];
@@ -137,15 +207,36 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             }
             BOOL(1)
         }
-        let _ = EnumChildWindows(shell_view, Some(find_slv), LPARAM(&mut syslistview as *mut _ as isize));
+        let _ = EnumChildWindows(
+            shell_view,
+            Some(find_slv),
+            LPARAM(&mut syslistview as *mut _ as isize),
+        );
 
-        let mut rect = windows::Win32::Foundation::RECT::default();
-        let _ = GetClientRect(target_parent, &mut rect);
+        if syslistview.is_invalid() {
+            warn!("[detect_desktop] SysListView32 not found! Desktop icons will not be interactable.");
+        } else {
+            info!("[detect_desktop] Found SysListView32 HWND: 0x{:X}", syslistview.0 as isize);
+        }
+
+        debug!("[detect_desktop] Querying Virtual Screen metrics (Multi-Monitor support)...");
+        let v_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let v_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let v_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let v_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+        info!("[detect_desktop] Virtual Screen Metrics: Origin({}, {}), Size({}x{})", v_x, v_y, v_width, v_height);
 
         Ok(DesktopDetection {
-            is_24h2, target_parent, shell_view, os_workerw, syslistview,
-            parent_width: rect.right,
-            parent_height: rect.bottom,
+            is_24h2,
+            target_parent,
+            shell_view,
+            os_workerw,
+            syslistview,
+            v_x,
+            v_y,
+            v_width,
+            v_height,
         })
     }
 }
@@ -159,103 +250,76 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    unsafe {
-        if GetParent(our_hwnd) == Ok(detection.target_parent) { return; }
+    debug!("[apply_injection] Beginning window injection process for HWND 0x{:X}", our_hwnd.0 as isize);
 
+    unsafe {
+        let current_parent = GetParent(our_hwnd).unwrap_or_default();
+        if current_parent == detection.target_parent {
+            debug!("[apply_injection] Window is already injected into target parent. Skipping.");
+            return;
+        }
+
+        debug!("[apply_injection] Stripping standard window styles (THICKFRAME, CAPTION, SYSMENU)...");
         let mut style = GetWindowLongW(our_hwnd, GWL_STYLE) as u32;
-        style &= !(WS_THICKFRAME.0 | WS_CAPTION.0 | WS_SYSMENU.0
-                  | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0 | WS_POPUP.0);
+        style &= !(WS_THICKFRAME.0
+            | WS_CAPTION.0
+            | WS_SYSMENU.0
+            | WS_MAXIMIZEBOX.0
+            | WS_MINIMIZEBOX.0
+            | WS_POPUP.0);
         style |= WS_CHILD.0 | WS_VISIBLE.0;
         let _ = SetWindowLongW(our_hwnd, GWL_STYLE, style as i32);
 
+        debug!("[apply_injection] Applying WS_EX_NOACTIVATE...");
+        let mut ex_style = GetWindowLongW(our_hwnd, GWL_EXSTYLE) as u32;
+        ex_style |= WS_EX_NOACTIVATE.0;
+        let _ = SetWindowLongW(our_hwnd, GWL_EXSTYLE, ex_style as i32);
+
+        debug!("[apply_injection] Calling SetParent...");
         let _ = SetParent(our_hwnd, detection.target_parent);
 
         if detection.is_24h2 {
-            let _ = SetWindowPos(our_hwnd, detection.shell_view, 0, 0, 0, 0,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
-            let _ = SetWindowPos(detection.os_workerw, our_hwnd, 0, 0, 0, 0,
-                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE);
+            debug!("[apply_injection] Applying 24H2 specific Z-Order placement...");
+            let _ = SetWindowPos(
+                our_hwnd,
+                detection.shell_view,
+                0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE,
+            );
+            let _ = SetWindowPos(
+                detection.os_workerw,
+                our_hwnd,
+                0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE,
+            );
+        } else {
+            debug!("[apply_injection] Applying standard Win10/11 Z-Order placement (HWND_BOTTOM)...");
+            let _ = SetWindowPos(
+                our_hwnd,
+                HWND_BOTTOM,
+                0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE,
+            );
         }
 
-        let _ = SetWindowPos(our_hwnd, HWND::default(),
-            0, 0, detection.parent_width, detection.parent_height,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-
-        // Verify injection
-        let actual_parent = GetParent(our_hwnd).unwrap_or_default();
-        let parent_ok = actual_parent == detection.target_parent;
-        let visible = IsWindowVisible(our_hwnd).as_bool();
-        info!("[diag] Injected: {}x{} ({}) parent_ok={} visible={} actual_parent=0x{:X}",
-            detection.parent_width, detection.parent_height,
-            if detection.is_24h2 { "24H2" } else { "Legacy" },
-            parent_ok, visible, actual_parent.0 as isize);
-    }
-}
-
-// ============================================================================
-// Windows: State Dump (diagnostic)
-// ============================================================================
-
-#[cfg(target_os = "windows")]
-fn dump_state(our_hwnd: windows::Win32::Foundation::HWND, det: &DesktopDetection) {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::*;
-    use windows::Win32::Foundation::RECT;
-
-    unsafe {
-        // Helper: get window info string
-        let describe = |hwnd: HWND, label: &str| -> String {
-            if hwnd.is_invalid() { return format!("  {} = NULL", label); }
-            let mut cls = [0u16; 64];
-            let len = GetClassNameW(hwnd, &mut cls);
-            let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
-            let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-            let exstyle = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-            let mut r = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut r);
-            let visible = IsWindowVisible(hwnd).as_bool();
-            let parent = GetParent(hwnd).unwrap_or_default();
-            format!("  {} = 0x{:X} class='{}' rect=({},{},{},{}) {}x{} style=0x{:08X} exstyle=0x{:08X} visible={} parent=0x{:X}",
-                label, hwnd.0 as isize, cls_name,
-                r.left, r.top, r.right, r.bottom, r.right - r.left, r.bottom - r.top,
-                style, exstyle, visible, parent.0 as isize)
-        };
-
-        // Enumerate children of target_parent for Z-order
-        let mut children = Vec::new();
-        let mut child = GetWindow(det.target_parent, GW_CHILD).unwrap_or_default();
-        for _ in 0..20 {
-            if child.is_invalid() { break; }
-            let mut cls = [0u16; 64];
-            let len = GetClassNameW(child, &mut cls);
-            let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
-            let visible = IsWindowVisible(child).as_bool();
-            children.push(format!("0x{:X}({}{})", child.0 as isize, cls_name, if visible { "" } else { ",hidden" }));
-            child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
-        }
-
-        // Get screen info
-        let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let screen_h = GetSystemMetrics(SM_CYSCREEN);
-
-        let dump = format!(
-            "[diag] === STATE DUMP ===\n\
-            [diag] Screen: {}x{}\n\
-            {}\n{}\n{}\n{}\n{}\n\
-            [diag] Z-order in target_parent (top→bottom): [{}]\n\
-            [diag] === END DUMP ===",
-            screen_w, screen_h,
-            describe(det.target_parent, "target_parent"),
-            describe(det.shell_view, "shell_view"),
-            describe(det.os_workerw, "os_workerw"),
-            describe(det.syslistview, "syslistview"),
-            describe(our_hwnd, "our_hwnd"),
-            children.join(", "),
+        debug!("[apply_injection] Expanding window to cover Virtual Screen...");
+        let _ = SetWindowPos(
+            our_hwnd,
+            HWND::default(),
+            detection.v_x,
+            detection.v_y,
+            detection.v_width,
+            detection.v_height,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
 
-        for line in dump.lines() {
-            info!("{}", line);
-        }
+        let final_parent = GetParent(our_hwnd).unwrap_or_default();
+        let is_visible = IsWindowVisible(our_hwnd).as_bool();
+
+        info!(
+            "[apply_injection] Injection Complete. State: Parent=0x{:X}, Visible={}, Rect=({}, {}, {}x{})",
+            final_parent.0 as isize, is_visible, detection.v_x, detection.v_y, detection.v_width, detection.v_height
+        );
     }
 }
 
@@ -267,18 +331,15 @@ fn dump_state(our_hwnd: windows::Win32::Foundation::HWND, det: &DesktopDetection
 fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
 
-    let our_hwnd = window.hwnd().map_err(|e| format!("{}", e))?;
-    let our_hwnd = HWND(our_hwnd.0 as *mut _);
-    let detection = detect_desktop()?;
+    debug!("[ensure_in_worker_w] Forcing ignore_cursor_events on Tauri window...");
+    let _ = window.set_ignore_cursor_events(true);
 
-    info!("[diag] detection: mode={} tp=0x{:X} sv=0x{:X} ww=0x{:X} slv=0x{:X} size={}x{} ourHwnd=0x{:X}",
-        if detection.is_24h2 { "24H2" } else { "Legacy" },
-        detection.target_parent.0 as isize,
-        detection.shell_view.0 as isize,
-        detection.os_workerw.0 as isize,
-        detection.syslistview.0 as isize,
-        detection.parent_width, detection.parent_height,
-        our_hwnd.0 as isize);
+    let our_hwnd_raw = window.hwnd().map_err(|e| format!("{}", e))?;
+    let our_hwnd = HWND(our_hwnd_raw.0 as *mut _);
+
+    info!("[ensure_in_worker_w] Tauri Webview HWND: 0x{:X}", our_hwnd.0 as isize);
+
+    let detection = detect_desktop()?;
 
     mouse_hook::set_webview_hwnd(our_hwnd.0 as isize);
     mouse_hook::set_target_parent_hwnd(detection.target_parent.0 as isize);
@@ -288,62 +349,51 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
     apply_injection(our_hwnd, &detection);
 
-    // State dump: window hierarchy, styles, positions, Z-order
-    dump_state(our_hwnd, &detection);
-
-    // Dispatch window MUST be created before poll thread (it posts messages to it)
+    debug!("[ensure_in_worker_w] Initializing Mouse Dispatch Proxy Window...");
     mouse_hook::init_dispatch_window();
 
-    // WebView2 bounds — poll for controller, then marshal SetBounds to main thread
-    let (w, h) = (detection.parent_width, detection.parent_height);
+    let (w, h) = (detection.v_width, detection.v_height);
+
+    debug!("[ensure_in_worker_w] Spawning Wry Composition Controller polling thread...");
     std::thread::spawn(move || {
         use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, FindWindowExW};
-        for _ in 0..60 {
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+        let mut controller_found = false;
+        for attempt in 1..=100 {
             let ptr = wry::get_last_composition_controller_ptr();
             if ptr != 0 {
+                info!("[wry_poll] Found Composition Controller at 0x{:X} on attempt {}", ptr, attempt);
                 mouse_hook::set_comp_controller_ptr(ptr);
-                // Find Chrome_RenderWidgetHostHWND (WebView2 accessibility window)
-                let wv_hwnd = HWND(mouse_hook::get_webview_hwnd() as *mut _);
-                if !wv_hwnd.is_invalid() {
-                    unsafe {
-                        let rwhh = FindWindowExW(wv_hwnd, HWND::default(),
-                            windows::core::w!("Chrome_WidgetWin_0"), None).unwrap_or_default();
-                        // Chrome_RenderWidgetHostHWND is a child of Chrome_WidgetWin_0,
-                        // or directly a child of the webview HWND
-                        let target = if !rwhh.is_invalid() {
-                            FindWindowExW(rwhh, HWND::default(),
-                                windows::core::w!("Chrome_RenderWidgetHostHWND"), None).unwrap_or_default()
-                        } else {
-                            // Try direct child
-                            FindWindowExW(wv_hwnd, HWND::default(),
-                                windows::core::w!("Chrome_RenderWidgetHostHWND"), None).unwrap_or_default()
-                        };
-                        if !target.is_invalid() {
-                            mouse_hook::set_chrome_rwhh(target.0 as isize);
-                            log::info!("[diag] Chrome_RWHH=0x{:X}", target.0 as isize);
-                        } else {
-                            log::warn!("[diag] Chrome_RenderWidgetHostHWND not found via FindWindowExW, relying on IsChild(wv) fallback");
-                        }
-                    }
-                }
-                log::info!("[diag] CompController=0x{:X}, requesting SetBounds {}x{} on main thread", ptr, w, h);
+
                 let dh = mouse_hook::get_dispatch_hwnd();
                 if dh != 0 {
+                    debug!("[wry_poll] Posting WM_MWP_SETBOUNDS_PUB ({}x{}) to dispatch window 0x{:X}", w, h, dh);
                     unsafe {
-                        let _ = PostMessageW(HWND(dh as *mut _),
+                        let _ = PostMessageW(
+                            HWND(dh as *mut _),
                             mouse_hook::WM_MWP_SETBOUNDS_PUB,
-                            WPARAM(w as usize), LPARAM(h as isize));
+                            WPARAM(w as usize),
+                            LPARAM(h as isize),
+                        );
                     }
+                } else {
+                    error!("[wry_poll] Dispatch window is 0! Cannot set bounds.");
                 }
-                return;
+                controller_found = true;
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        log::warn!("CompositionController not found after 3s");
+
+        if !controller_found {
+            error!("[wry_poll] CRITICAL: CompositionController not found after 5 seconds of polling! Wallpaper engine will fail to render inputs/bounds.");
+        }
     });
 
+    info!("[ensure_in_worker_w] Starting low-level mouse hook thread...");
     mouse_hook::start_hook_thread();
+
     Ok(())
 }
 
@@ -353,21 +403,22 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
+    use log::{debug, error, info, warn};
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    const MOUSE_MOVE: i32   = 0x0200;
-    const MOUSE_LDOWN: i32  = 0x0201;
-    const MOUSE_LUP: i32    = 0x0202;
-    const MOUSE_RDOWN: i32  = 0x0204;
-    const MOUSE_RUP: i32    = 0x0205;
-    const MOUSE_MDOWN: i32  = 0x0207;
-    const MOUSE_MUP: i32    = 0x0208;
-    const MOUSE_WHEEL: i32  = 0x020A;
+    const MOUSE_MOVE: i32 = 0x0200;
+    const MOUSE_LDOWN: i32 = 0x0201;
+    const MOUSE_LUP: i32 = 0x0202;
+    const MOUSE_RDOWN: i32 = 0x0204;
+    const MOUSE_RUP: i32 = 0x0205;
+    const MOUSE_MDOWN: i32 = 0x0207;
+    const MOUSE_MUP: i32 = 0x0208;
+    const MOUSE_WHEEL: i32 = 0x020A;
     const MOUSE_HWHEEL: i32 = 0x020E;
 
-    const VK_NONE: i32    = 0x0;
+    const VK_NONE: i32 = 0x0;
     const VK_LBUTTON: i32 = 0x1;
     const VK_RBUTTON: i32 = 0x2;
     const VK_MBUTTON: i32 = 0x10;
@@ -379,40 +430,32 @@ pub mod mouse_hook {
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
+    static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
     const STATE_IDLE: u8 = 0;
     const STATE_DRAGGING: u8 = 1;
     const STATE_NATIVE: u8 = 2;
     static HOOK_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 
-    // Diagnostic: log first N events at each stage
-    static DIAG_HOOK: AtomicBool = AtomicBool::new(true);
-    static DIAG_DISPATCH: AtomicBool = AtomicBool::new(true);
-    static DIAG_MISS_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    static DIAG_MISS_LOGGED: AtomicBool = AtomicBool::new(false);
+    static DIAG_POST_FAIL: AtomicBool = AtomicBool::new(true);
 
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
-    const WM_MWP_SETBOUNDS: u32 = 0x8000 + 43;
+    pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
 
-    pub fn set_webview_hwnd(h: isize)        { WEBVIEW_HWND.store(h, Ordering::SeqCst); }
-    pub fn set_syslistview_hwnd(h: isize)    { SYSLISTVIEW_HWND.store(h, Ordering::SeqCst); }
-    pub fn set_target_parent_hwnd(h: isize)  { TARGET_PARENT_HWND.store(h, Ordering::SeqCst); }
-    pub fn get_syslistview_hwnd() -> isize   { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
+    pub fn set_webview_hwnd(h: isize) { WEBVIEW_HWND.store(h, Ordering::SeqCst); }
+    pub fn set_syslistview_hwnd(h: isize) { SYSLISTVIEW_HWND.store(h, Ordering::SeqCst); }
+    pub fn set_target_parent_hwnd(h: isize) { TARGET_PARENT_HWND.store(h, Ordering::SeqCst); }
+    pub fn get_syslistview_hwnd() -> isize { SYSLISTVIEW_HWND.load(Ordering::SeqCst) }
     pub fn set_comp_controller_ptr(p: isize) { COMP_CONTROLLER_PTR.store(p, Ordering::SeqCst); }
     pub fn get_comp_controller_ptr() -> isize { COMP_CONTROLLER_PTR.load(Ordering::SeqCst) }
     pub fn get_dispatch_hwnd() -> isize { DISPATCH_HWND.load(Ordering::SeqCst) }
-    pub fn set_chrome_rwhh(h: isize) { CHROME_RWHH.store(h, Ordering::SeqCst); }
-    pub fn get_webview_hwnd() -> isize { WEBVIEW_HWND.load(Ordering::SeqCst) }
-    pub const WM_MWP_SETBOUNDS_PUB: u32 = WM_MWP_SETBOUNDS;
-
-    static DIAG_POST_FAIL: AtomicBool = AtomicBool::new(true);
 
     #[inline]
     unsafe fn post_mouse(kind: i32, vk: i32, data: u32, x: i32, y: i32) {
         let dh = DISPATCH_HWND.load(Ordering::Relaxed);
         if dh == 0 {
             if DIAG_POST_FAIL.swap(false, Ordering::Relaxed) {
-                log::error!("[diag] post_mouse: DISPATCH_HWND=0, events lost");
+                error!("[mouse_hook] post_mouse dropped: DISPATCH_HWND is 0");
             }
             return;
         }
@@ -420,19 +463,20 @@ pub mod mouse_hook {
         let lp = LPARAM(((x as i16 as u16 as u32) | ((y as i16 as u16 as u32) << 16)) as isize);
         if let Err(e) = PostMessageW(HWND(dh as *mut _), WM_MWP_MOUSE, wp, lp) {
             if DIAG_POST_FAIL.swap(false, Ordering::Relaxed) {
-                log::error!("[diag] PostMessageW FAILED: {} dh=0x{:X}", e, dh);
+                error!("[mouse_hook] PostMessageW FAILED to dispatch window 0x{:X}: {}", dh, e);
             }
         }
     }
 
     unsafe extern "system" fn dispatch_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-        if msg == WM_MWP_SETBOUNDS {
+        if msg == WM_MWP_SETBOUNDS_PUB {
             let w = wp.0 as i32;
             let h = lp.0 as i32;
             let ptr = get_comp_controller_ptr();
+            debug!("[dispatch_wnd_proc] Received SETBOUNDS: {}x{} for CompPtr 0x{:X}", w, h, ptr);
             if ptr != 0 {
                 let result = wry::set_controller_bounds_raw(ptr, w, h);
-                log::info!("[diag] SetBounds (main thread): {}x{} result={:?}", w, h, result);
+                info!("[dispatch_wnd_proc] SetBounds Applied. Result: {:?}", result);
             }
             return LRESULT(0);
         }
@@ -443,15 +487,11 @@ pub mod mouse_hook {
             let x = (lp.0 & 0xFFFF) as i16 as i32;
             let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
             let ptr = get_comp_controller_ptr();
-            if DIAG_DISPATCH.swap(false, Ordering::Relaxed) {
-                log::info!("[diag] dispatch: kind=0x{:X} vk=0x{:X} data={} x={} y={} ptr=0x{:X}", kind, vk, data, x, y, ptr);
-            }
+
             if ptr != 0 {
                 if let Err(e) = wry::send_mouse_input_raw(ptr, kind, vk, data, x, y) {
-                    log::error!("[diag] SendMouseInput FAILED: {} kind=0x{:X} x={} y={}", e, kind, x, y);
+                    error!("[dispatch_wnd_proc] WRY send_mouse_input_raw FAILED: {}", e);
                 }
-            } else {
-                log::error!("[diag] dispatch: ptr=0, no CompController — dropping event");
             }
             return LRESULT(0);
         }
@@ -461,60 +501,64 @@ pub mod mouse_hook {
     pub fn init_dispatch_window() {
         unsafe {
             let cls = windows::core::w!("MWP_MouseDispatch");
-            let wc = WNDCLASSW { lpfnWndProc: Some(dispatch_wnd_proc), lpszClassName: cls, ..Default::default() };
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(dispatch_wnd_proc),
+                lpszClassName: cls,
+                ..Default::default()
+            };
             let _ = RegisterClassW(&wc);
-            match CreateWindowExW(WINDOW_EX_STYLE(0), cls, windows::core::w!(""),
-                WINDOW_STYLE(0), 0, 0, 0, 0, HWND_MESSAGE, None, None, None)
-            {
+            match CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                cls,
+                windows::core::w!(""),
+                WINDOW_STYLE(0),
+                0, 0, 0, 0,
+                HWND_MESSAGE,
+                None,
+                None,
+                None,
+            ) {
                 Ok(h) => {
                     DISPATCH_HWND.store(h.0 as isize, Ordering::SeqCst);
-                    log::info!("[diag] dispatch window=0x{:X}", h.0 as isize);
+                    info!("[init_dispatch_window] Proxy window mapped at 0x{:X}", h.0 as isize);
                 }
                 Err(e) => {
-                    log::error!("[diag] dispatch window FAILED: {}", e);
+                    error!("[init_dispatch_window] Failed to create proxy window: {}", e);
                 }
             }
         }
     }
 
-    /// Cursor is over the desktop area. Checks:
-    /// 1. Direct hit on target_parent, SysListView32, or cached Chrome_RenderWidgetHostHWND
-    /// 2. Child of target_parent (SHELLDLL_DefView, our Tauri Window, etc.)
-    /// 3. Child of WebView HWND
-    /// 4. Auto-discover Chrome_RenderWidgetHostHWND by class name (composition mode:
-    ///    it's a detached top-level window, not child of anything we own)
     #[inline]
     unsafe fn is_over_desktop(hwnd_under: HWND) -> bool {
         let tp = HWND(TARGET_PARENT_HWND.load(Ordering::Relaxed) as *mut _);
         let slv = HWND(SYSLISTVIEW_HWND.load(Ordering::Relaxed) as *mut _);
         let rwhh = HWND(CHROME_RWHH.load(Ordering::Relaxed) as *mut _);
-        // Fast path: direct HWND comparison (most common cases)
-        if hwnd_under == tp || hwnd_under == slv
-            || (!rwhh.is_invalid() && hwnd_under == rwhh) {
-            return true;
-        }
-        // HWND tree walk: child of target_parent (Progman/WorkerW)
-        if IsChild(tp, hwnd_under).as_bool() {
-            return true;
-        }
-        // Child of WebView HWND
         let wv = HWND(WEBVIEW_HWND.load(Ordering::Relaxed) as *mut _);
-        if !wv.is_invalid() && IsChild(wv, hwnd_under).as_bool() {
+
+        // Fast path 1: Cached Chrome_RenderWidgetHostHWND
+        if !rwhh.is_invalid() && hwnd_under == rwhh {
             return true;
         }
-        // Auto-discover Chrome_RenderWidgetHostHWND by class name.
-        // In composition mode it's a detached top-level window (different process,
-        // not a child of our HWND or Progman). Once found, cache for fast path.
+        // Fast path 2: Known roots
+        if hwnd_under == tp || hwnd_under == slv || hwnd_under == wv {
+            return true;
+        }
+        // Hierarchy check
+        if IsChild(tp, hwnd_under).as_bool() || (!wv.is_invalid() && IsChild(wv, hwnd_under).as_bool()) {
+            return true;
+        }
+
+        // Auto-discovery of Chrome_RenderWidgetHostHWND
         if rwhh.is_invalid() {
             let mut cls = [0u16; 40];
             let len = GetClassNameW(hwnd_under, &mut cls) as usize;
-            // "Chrome_RenderWidgetHostHWND" = 31 chars — zero-alloc ASCII compare
             if len == 31 {
                 const EXPECTED: &[u8] = b"Chrome_RenderWidgetHostHWND";
                 let matches = cls[..len].iter().zip(EXPECTED.iter()).all(|(&c, &e)| c == e as u16);
                 if matches {
                     CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
-                    log::info!("[diag] Auto-discovered Chrome_RWHH=0x{:X}", hwnd_under.0 as isize);
+                    info!("[is_over_desktop] Auto-discovered Chrome_RWHH at 0x{:X}", hwnd_under.0 as isize);
                     return true;
                 }
             }
@@ -523,52 +567,26 @@ pub mod mouse_hook {
     }
 
     #[inline]
-    unsafe fn forward(msg: u32, info: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
-        let x = cx.max(0);
-        let y = cy.max(0);
-        match msg {
-            WM_MOUSEMOVE   => post_mouse(MOUSE_MOVE, DRAG_VK.load(Ordering::Relaxed) as i32, 0, x, y),
-            WM_LBUTTONDOWN => { DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed); post_mouse(MOUSE_LDOWN, VK_LBUTTON, 0, x, y); }
-            WM_LBUTTONUP   => { DRAG_VK.store(0, Ordering::Relaxed); post_mouse(MOUSE_LUP, VK_NONE, 0, x, y); }
-            WM_RBUTTONDOWN => { DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed); post_mouse(MOUSE_RDOWN, VK_RBUTTON, 0, x, y); }
-            WM_RBUTTONUP   => { DRAG_VK.store(0, Ordering::Relaxed); post_mouse(MOUSE_RUP, VK_NONE, 0, x, y); }
-            WM_MBUTTONDOWN => { DRAG_VK.store(VK_MBUTTON as isize, Ordering::Relaxed); post_mouse(MOUSE_MDOWN, VK_MBUTTON, 0, x, y); }
-            WM_MBUTTONUP   => { DRAG_VK.store(0, Ordering::Relaxed); post_mouse(MOUSE_MUP, VK_NONE, 0, x, y); }
-            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                let delta = (info.mouseData >> 16) as i16 as i32 as u32;
-                let kind = if msg == WM_MOUSEWHEEL { MOUSE_WHEEL } else { MOUSE_HWHEEL };
-                post_mouse(kind, VK_NONE, delta, x, y);
-            }
-            _ => {}
-        }
-    }
-
-    /// Check if mouse is over a desktop icon using Windows Accessibility API.
-    /// Returns true if `accHitTest` at (x,y) returns a child object (VT_DISPATCH).
-    /// Requires COM to be initialized on the calling thread.
-    #[inline]
     unsafe fn is_mouse_over_desktop_icon(x: i32, y: i32) -> bool {
-        use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
         use windows::core::VARIANT;
         use windows::Win32::Foundation::POINT;
+        use windows::Win32::System::Variant::{VT_DISPATCH, VT_I4};
+        use windows::Win32::UI::Accessibility::{AccessibleObjectFromPoint, IAccessible};
 
         let pt = POINT { x, y };
         let mut p_acc: Option<IAccessible> = None;
         let mut var_child = VARIANT::default();
+
         if AccessibleObjectFromPoint(pt, &mut p_acc, &mut var_child).is_ok() {
             if let Some(acc) = p_acc {
-                // accHitTest returns VARIANT:
-                // - VT_I4 with CHILDID_SELF (0) = background, no icon
-                // - VT_DISPATCH = child accessible object = icon
                 match acc.accHitTest(x, y) {
                     Ok(hit) => {
-                        if let Ok(val) = i32::try_from(&hit) {
-                            val > 0 // positive child ID = icon
+                        let vt = hit.as_raw().Anonymous.Anonymous.vt;
+                        if vt == VT_I4.0 as u16 {
+                            let val = hit.as_raw().Anonymous.Anonymous.Anonymous.lVal;
+                            val > 0
                         } else {
-                            // Only VT_DISPATCH (=9) means a child object (icon).
-                            // VT_EMPTY, VT_NULL, or any other type = not an icon.
-                            let vt = hit.as_raw().Anonymous.Anonymous.vt;
-                            vt == 9 // VT_DISPATCH
+                            vt == VT_DISPATCH.0 as u16
                         }
                     }
                     Err(_) => false,
@@ -581,21 +599,67 @@ pub mod mouse_hook {
         }
     }
 
+    #[inline]
+    unsafe fn forward(msg: u32, info: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
+        let x = cx;
+        let y = cy;
+        match msg {
+            WM_MOUSEMOVE => post_mouse(MOUSE_MOVE, DRAG_VK.load(Ordering::Relaxed) as i32, 0, x, y),
+            WM_LBUTTONDOWN => {
+                DRAG_VK.store(VK_LBUTTON as isize, Ordering::Relaxed);
+                post_mouse(MOUSE_LDOWN, VK_LBUTTON, 0, x, y);
+            }
+            WM_LBUTTONUP => {
+                DRAG_VK.store(0, Ordering::Relaxed);
+                post_mouse(MOUSE_LUP, VK_NONE, 0, x, y);
+            }
+            WM_RBUTTONDOWN => {
+                DRAG_VK.store(VK_RBUTTON as isize, Ordering::Relaxed);
+                post_mouse(MOUSE_RDOWN, VK_RBUTTON, 0, x, y);
+            }
+            WM_RBUTTONUP => {
+                DRAG_VK.store(0, Ordering::Relaxed);
+                post_mouse(MOUSE_RUP, VK_NONE, 0, x, y);
+            }
+            WM_MBUTTONDOWN => {
+                DRAG_VK.store(VK_MBUTTON as isize, Ordering::Relaxed);
+                post_mouse(MOUSE_MDOWN, VK_MBUTTON, 0, x, y);
+            }
+            WM_MBUTTONUP => {
+                DRAG_VK.store(0, Ordering::Relaxed);
+                post_mouse(MOUSE_MUP, VK_NONE, 0, x, y);
+            }
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                let delta = (info.mouseData >> 16) as i16 as i32 as u32;
+                let kind = if msg == WM_MOUSEWHEEL { MOUSE_WHEEL } else { MOUSE_HWHEEL };
+                post_mouse(kind, VK_NONE, delta, x, y);
+            }
+            _ => {}
+        }
+    }
+
     pub fn start_hook_thread() {
         std::thread::spawn(|| {
-            // Initialize COM for Accessibility API (accHitTest) on this thread
+            debug!("[start_hook_thread] Hook thread spawned. Initializing COM...");
             unsafe {
                 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                if let Err(e) = CoInitializeEx(None, COINIT_APARTMENTTHREADED) {
+                    error!("[start_hook_thread] COM Initialization Failed: {}", e);
+                } else {
+                    debug!("[start_hook_thread] COM Initialized (COINIT_APARTMENTTHREADED).");
+                }
             }
 
             unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+                let hook_h = HHOOK(HOOK_HANDLE.load(Ordering::Relaxed) as *mut _);
+
                 if code < 0 {
-                    return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
+
                 let wv_raw = WEBVIEW_HWND.load(Ordering::Relaxed);
                 if wv_raw == 0 {
-                    return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
                 let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
@@ -605,84 +669,82 @@ pub mod mouse_hook {
                 let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP;
                 let state = HOOK_STATE.load(Ordering::Relaxed);
 
-                // STATE_NATIVE: desktop icon interaction — pass everything through to Windows
+                // STATE_NATIVE (Interacting with a real Desktop Icon)
                 if state == STATE_NATIVE {
-                    if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
-                    return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                    if is_up {
+                        debug!("[hook_proc] Mouse UP received. Transitioning from NATIVE to IDLE.");
+                        HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
+                    }
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // STATE_DRAGGING: forward everything to WebView until button up
+                // STATE_DRAGGING (Holding a click on the WebView, forward everything)
                 if state == STATE_DRAGGING {
                     use windows::Win32::Graphics::Gdi::ScreenToClient;
                     let mut cp = info.pt;
                     let _ = ScreenToClient(wv, &mut cp);
                     forward(msg, &info, cp.x, cp.y);
-                    if is_up { HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed); }
-                    if msg == WM_MOUSEMOVE { return CallNextHookEx(HHOOK::default(), code, wparam, lparam); }
+                    if is_up {
+                        debug!("[hook_proc] Mouse UP received. Transitioning from DRAGGING to IDLE.");
+                        HOOK_STATE.store(STATE_IDLE, Ordering::Relaxed);
+                    }
+                    if msg == WM_MOUSEMOVE {
+                        return CallNextHookEx(hook_h, code, wparam, lparam);
+                    }
                     return LRESULT(1);
                 }
 
-                // STATE_IDLE: check if over desktop area
+                // STATE_IDLE
                 let hwnd_under = WindowFromPoint(info.pt);
                 if !is_over_desktop(hwnd_under) {
-                    // Log first 3 misses so we know what HWND is blocking
-                    if !DIAG_MISS_LOGGED.load(Ordering::Relaxed) {
-                        let count = DIAG_MISS_COUNT.fetch_add(1, Ordering::Relaxed);
-                        if count < 3 {
-                            let tp = TARGET_PARENT_HWND.load(Ordering::Relaxed);
-                            let slv = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
-                            let wv_diag = WEBVIEW_HWND.load(Ordering::Relaxed);
-                            let mut cls = [0u16; 64];
-                            let len = GetClassNameW(hwnd_under, &mut cls);
-                            let cls_name = String::from_utf16_lossy(&cls[..len as usize]);
-                            log::warn!("[diag] MISS {}/3: under=0x{:X} class='{}' pt=({},{}) tp=0x{:X} slv=0x{:X} wv=0x{:X} isChild(tp)={} isChild(wv)={}",
-                                count+1, hwnd_under.0 as isize, cls_name, info.pt.x, info.pt.y,
-                                tp, slv, wv_diag,
-                                IsChild(HWND(tp as *mut _), hwnd_under).as_bool(),
-                                IsChild(HWND(wv_diag as *mut _), hwnd_under).as_bool());
-                        } else {
-                            DIAG_MISS_LOGGED.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // On button down: decide NATIVE (icon click) vs DRAGGING (WebView)
+                // Evaluate Desktop Icon Intersection
                 if is_down {
                     if is_mouse_over_desktop_icon(info.pt.x, info.pt.y) {
+                        debug!("[hook_proc] Icon HitTest TRUE at {},{}. Transitioning IDLE -> NATIVE", info.pt.x, info.pt.y);
                         HOOK_STATE.store(STATE_NATIVE, Ordering::Relaxed);
-                        return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                        return CallNextHookEx(hook_h, code, wparam, lparam);
                     }
+                    debug!("[hook_proc] Icon HitTest FALSE at {},{}. Transitioning IDLE -> DRAGGING", info.pt.x, info.pt.y);
                     HOOK_STATE.store(STATE_DRAGGING, Ordering::Relaxed);
                 }
 
+                // Forward Event Coordinates Translated to Client Area
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
                 let mut cp = info.pt;
-                let stc_ok = ScreenToClient(wv, &mut cp).as_bool();
+                let _ = ScreenToClient(wv, &mut cp);
 
-                if DIAG_HOOK.swap(false, Ordering::Relaxed) {
-                    let tp = TARGET_PARENT_HWND.load(Ordering::Relaxed);
-                    let slv = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
-                    log::info!("[diag] hook hit: under=0x{:X} tp=0x{:X} slv=0x{:X} wv=0x{:X} screen=({},{}) client=({},{}) stc_ok={} msg=0x{:X}",
-                        hwnd_under.0 as isize, tp, slv, wv_raw, info.pt.x, info.pt.y, cp.x, cp.y, stc_ok, msg);
-                }
                 forward(msg, &info, cp.x, cp.y);
-                if msg == WM_MOUSEMOVE { return CallNextHookEx(HHOOK::default(), code, wparam, lparam); }
+
+                // Allow mouse visual to move, but block programmatic click propagation
+                if msg == WM_MOUSEMOVE {
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
                 LRESULT(1)
             }
 
             unsafe {
+                debug!("[start_hook_thread] Installing WH_MOUSE_LL hook...");
                 let hook_result = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0);
                 match &hook_result {
-                    Ok(h) => log::info!("[diag] hook installed=0x{:X}", h.0 as isize),
-                    Err(e) => log::error!("[diag] hook FAILED: {}", e),
+                    Ok(h) => {
+                        HOOK_HANDLE.store(h.0 as isize, Ordering::SeqCst);
+                        info!("[start_hook_thread] WH_MOUSE_LL Hook installed successfully: 0x{:X}", h.0 as isize);
+                    }
+                    Err(e) => {
+                        error!("[start_hook_thread] WH_MOUSE_LL Hook FAILED: {}", e);
+                    }
                 }
-                let _h = hook_result;
+
+                debug!("[start_hook_thread] Entering message loop for hook thread.");
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+                warn!("[start_hook_thread] Message loop exited unexpectedly.");
             }
         });
     }
