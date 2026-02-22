@@ -1,10 +1,10 @@
-//! Window Layer — Desktop WebView injection + mouse forwarding.
+//! Window Layer — Desktop WebView injection + mouse forwarding (Windows only).
 //!
-//! Windows: Injects WebView into Progman/WorkerW hierarchy. Low-level mouse hook
-//!          intercepts events over the desktop and forwards them to WebView2 via
-//!          SendMouseInput (composition mode).
-//! macOS:   kCGDesktopWindowLevel behind desktop icons, ignores mouse events.
+//! Injects WebView into Progman/WorkerW hierarchy. Low-level mouse hook
+//! intercepts events over the desktop and forwards them to WebView2 via
+//! SendMouseInput (composition mode).
 
+#[cfg(target_os = "windows")]
 use log::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,15 +14,12 @@ static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
 // Entry Point
 // ============================================================================
 
-pub fn setup_desktop_window(window: &tauri::WebviewWindow) {
+pub fn setup_desktop_window(_window: &tauri::WebviewWindow) {
+    #[cfg(target_os = "windows")]
+    let window = _window;
     #[cfg(target_os = "windows")]
     if let Err(e) = ensure_in_worker_w(window) {
         warn!("Failed to setup Windows desktop layer: {}", e);
-    }
-
-    #[cfg(target_os = "macos")]
-    if let Err(e) = setup_macos_desktop(window) {
-        warn!("Failed to setup macOS desktop layer: {}", e);
     }
 }
 
@@ -31,7 +28,9 @@ pub fn setup_desktop_window(window: &tauri::WebviewWindow) {
 // ============================================================================
 
 #[tauri::command]
-pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
+pub fn set_desktop_icons_visible(_visible: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let visible = _visible;
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
@@ -42,15 +41,6 @@ pub fn set_desktop_icons_visible(visible: bool) -> Result<(), String> {
             unsafe { let _ = ShowWindow(HWND(slv as *mut _), if visible { SW_SHOW } else { SW_HIDE }); }
             info!("Desktop icons visibility: {}", visible);
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let val = if visible { "true" } else { "false" };
-        let _ = std::process::Command::new("defaults")
-            .args(["write", "com.apple.finder", "CreateDesktop", val])
-            .output();
-        let _ = std::process::Command::new("killall").arg("Finder").output();
     }
 
     Ok(())
@@ -70,13 +60,6 @@ pub fn restore_desktop_icons() {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("defaults")
-            .args(["write", "com.apple.finder", "CreateDesktop", "true"])
-            .output();
-        let _ = std::process::Command::new("killall").arg("Finder").output();
-    }
 }
 
 // ============================================================================
@@ -694,30 +677,4 @@ pub mod visibility_watchdog {
 
     #[cfg(not(target_os = "windows"))]
     pub fn start(_app: AppHandle) {}
-}
-
-// ============================================================================
-// macOS
-// ============================================================================
-
-#[cfg(target_os = "macos")]
-fn setup_macos_desktop(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use tauri::Manager;
-    let ns = window.ns_window().map_err(|e| e.to_string())? as *mut objc::runtime::Object;
-
-    use objc::{msg_send, sel, sel_impl, class};
-    unsafe {
-        let _: () = msg_send![ns, setLevel: -2147483623_isize];
-        let _: () = msg_send![ns, setCollectionBehavior: 81_usize];
-        let _: () = msg_send![ns, setIgnoresMouseEvents: true];
-
-        let pi: *mut objc::runtime::Object = msg_send![class!(NSProcessInfo), processInfo];
-        let reason: *mut objc::runtime::Object = msg_send![class!(NSString), alloc];
-        let reason: *mut objc::runtime::Object = msg_send![reason,
-            initWithBytes:b"Wallpaper Animation\0".as_ptr() length:19_usize encoding:4_usize];
-        let _: *mut objc::runtime::Object = msg_send![pi, beginActivityWithOptions:0x00FFFFFF_u64 reason:reason];
-    }
-
-    info!("macOS desktop layer ready.");
-    Ok(())
 }
