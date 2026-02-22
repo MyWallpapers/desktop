@@ -6,9 +6,12 @@
 
 #[cfg(target_os = "windows")]
 use log::{debug, error, info, warn};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicIsize;
 
 static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
 pub static HOOK_HANDLE_GLOBAL: AtomicIsize = AtomicIsize::new(0);
 
 // ============================================================================
@@ -78,10 +81,7 @@ pub fn restore_desktop_icons() {
 
 #[cfg(target_os = "windows")]
 struct DesktopDetection {
-    is_24h2: bool,
     target_parent: windows::Win32::Foundation::HWND,
-    shell_view: windows::Win32::Foundation::HWND,
-    os_workerw: windows::Win32::Foundation::HWND,
     syslistview: windows::Win32::Foundation::HWND,
     v_x: i32,
     v_y: i32,
@@ -105,10 +105,8 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
         let mut msg_result: usize = 0;
         let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0x0D), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut msg_result));
 
-        let mut is_24h2 = false;
         let mut target_parent = HWND::default();
         let mut shell_view = HWND::default();
-        let mut os_workerw = HWND::default();
 
         for attempt in 1..=40 {
             // Check for Windows 11 24H2+ layout
@@ -117,10 +115,8 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
 
             if !sv.is_invalid() && !ww.is_invalid() {
                 info!("[detect_desktop] Discovered Windows 11 24H2+ architecture on attempt {}", attempt);
-                is_24h2 = true;
-                target_parent = ww; // FIX: Inject INTO WorkerW, not Progman
+                target_parent = ww;
                 shell_view = sv;
-                os_workerw = ww;
                 break;
             }
 
@@ -189,7 +185,8 @@ fn detect_desktop() -> Result<DesktopDetection, String> {
             m_rects.right - m_rects.left, m_rects.bottom - m_rects.top);
 
         Ok(DesktopDetection {
-            is_24h2, target_parent, shell_view, os_workerw, syslistview,
+            target_parent,
+            syslistview,
             v_x: m_rects.left, v_y: m_rects.top,
             v_width: m_rects.right - m_rects.left,
             v_height: m_rects.bottom - m_rects.top,
