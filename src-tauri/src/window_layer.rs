@@ -678,6 +678,9 @@ pub mod mouse_hook {
     static DRAG_START_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static DRAG_START_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static DRAG_ITEM_INDEX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    // Offset entre le curseur et le coin haut-gauche de l'icône au moment du grab
+    static DRAG_OFFSET_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static DRAG_OFFSET_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
     pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -1150,6 +1153,69 @@ pub mod mouse_hook {
         ht_out.i_item
     }
 
+    /// Get icon position (client coords) in SysListView32 via LVM_GETITEMPOSITION.
+    unsafe fn get_item_position(
+        slv: HWND,
+        item_index: i32,
+    ) -> Option<windows::Win32::Foundation::POINT> {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+        use windows::Win32::System::Memory::{
+            VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+        };
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+        };
+
+        const LVM_GETITEMPOSITION: u32 = 0x1000 + 16;
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(slv, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+
+        let proc = OpenProcess(
+            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+            false,
+            pid,
+        )
+        .ok()?;
+
+        let size = std::mem::size_of::<windows::Win32::Foundation::POINT>();
+        let remote = VirtualAllocEx(proc, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if remote.is_null() {
+            let _ = CloseHandle(proc);
+            return None;
+        }
+
+        // Initialiser à zéro
+        let zero_pt = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+        let _ = WriteProcessMemory(proc, remote, &zero_pt as *const _ as _, size, None);
+
+        let mut result: usize = 0;
+        let _ = SendMessageTimeoutW(
+            slv,
+            LVM_GETITEMPOSITION,
+            WPARAM(item_index as usize),
+            LPARAM(remote as isize),
+            SMTO_ABORTIFHUNG,
+            100,
+            Some(&mut result),
+        );
+
+        let mut pt_out = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+        let _ = ReadProcessMemory(proc, remote, &mut pt_out as *mut _ as _, size, None);
+        let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+        let _ = CloseHandle(proc);
+
+        if result != 0 {
+            Some(pt_out)
+        } else {
+            None
+        }
+    }
+
     #[inline]
     unsafe fn forward(msg: u32, info_hook: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
         match msg {
@@ -1369,6 +1435,11 @@ pub mod mouse_hook {
                                 let slv_h = HWND(slv_raw as *mut _);
                                 let mut drop_pt = info_hook.pt;
                                 let _ = ScreenToClient(slv_h, &mut drop_pt);
+                                // Appliquer l'offset de grab
+                                let off_x = DRAG_OFFSET_X.load(Ordering::Relaxed);
+                                let off_y = DRAG_OFFSET_Y.load(Ordering::Relaxed);
+                                drop_pt.x -= off_x;
+                                drop_pt.y -= off_y;
                                 const LVM_SETITEMPOSITION: u32 = 0x100F;
                                 let lp = ((drop_pt.x as i16 as u16 as u32)
                                     | ((drop_pt.y as i16 as u16 as u32) << 16))
@@ -1380,8 +1451,8 @@ pub mod mouse_hook {
                                     LPARAM(lp),
                                 );
                                 log::info!(
-                                    "[hook] DRAG complete: item={} from ({},{}) to client({},{})",
-                                    item_idx, start_x, start_y, drop_pt.x, drop_pt.y
+                                    "[hook] DRAG complete: item={} to client({},{})",
+                                    item_idx, drop_pt.x, drop_pt.y
                                 );
                             }
                         } else {
@@ -1391,7 +1462,7 @@ pub mod mouse_hook {
                             }
                         }
                     } else if msg == WM_MOUSEMOVE {
-                        // Pendant le drag: déplacer l'icône en temps réel
+                        // Pendant le drag: déplacer l'icône en temps réel avec offset de grab
                         let start_x = DRAG_START_X.load(Ordering::Relaxed);
                         let start_y = DRAG_START_Y.load(Ordering::Relaxed);
                         let dx = (info_hook.pt.x - start_x).abs();
@@ -1404,6 +1475,10 @@ pub mod mouse_hook {
                                 let slv_h = HWND(slv_raw as *mut _);
                                 let mut cp = info_hook.pt;
                                 let _ = ScreenToClient(slv_h, &mut cp);
+                                let off_x = DRAG_OFFSET_X.load(Ordering::Relaxed);
+                                let off_y = DRAG_OFFSET_Y.load(Ordering::Relaxed);
+                                cp.x -= off_x;
+                                cp.y -= off_y;
                                 const LVM_SETITEMPOSITION: u32 = 0x100F;
                                 let lp = ((cp.x as i16 as u16 as u32)
                                     | ((cp.y as i16 as u16 as u32) << 16))
@@ -1468,16 +1543,30 @@ pub mod mouse_hook {
                 // Enregistrer position de départ et index item pour le drag.
                 if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) && slv_raw != 0 {
                     if hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt) {
+                        let slv_h = HWND(slv_raw as *mut _);
                         NATIVE_DRAG.store(true, Ordering::Relaxed);
                         DRAG_START_X.store(info_hook.pt.x, Ordering::Relaxed);
                         DRAG_START_Y.store(info_hook.pt.y, Ordering::Relaxed);
-                        // Récupérer l'index de l'item sous le curseur
-                        let item_idx = get_hit_item_index(HWND(slv_raw as *mut _), &info_hook.pt);
+                        let item_idx = get_hit_item_index(slv_h, &info_hook.pt);
                         DRAG_ITEM_INDEX.store(item_idx, Ordering::Relaxed);
-                        post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
+
+                        // Calculer l'offset de grab (curseur → coin haut-gauche icône)
+                        if item_idx >= 0 {
+                            if let Some(icon_pos) = get_item_position(slv_h, item_idx) {
+                                // Convertir le curseur en coords client SysListView32
+                                let mut cursor_client = info_hook.pt;
+                                let _ = ScreenToClient(slv_h, &mut cursor_client);
+                                DRAG_OFFSET_X.store(cursor_client.x - icon_pos.x, Ordering::Relaxed);
+                                DRAG_OFFSET_Y.store(cursor_client.y - icon_pos.y, Ordering::Relaxed);
+                            }
+                        }
+
+                        post_to_slv(slv_h, msg, &info_hook);
                         log::info!(
-                            "[hook] NATIVE_DRAG start at ({},{}) item={}",
-                            info_hook.pt.x, info_hook.pt.y, item_idx
+                            "[hook] NATIVE_DRAG start at ({},{}) item={} offset=({},{})",
+                            info_hook.pt.x, info_hook.pt.y, item_idx,
+                            DRAG_OFFSET_X.load(Ordering::Relaxed),
+                            DRAG_OFFSET_Y.load(Ordering::Relaxed),
                         );
                         return CallNextHookEx(hook_h, code, wparam, lparam);
                     }
