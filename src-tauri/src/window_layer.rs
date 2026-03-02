@@ -54,7 +54,7 @@ pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
         // visible=false → interface mode (icons hidden, UI interactable)
         // visible=true  → wallpaper mode (icons shown, passthrough logic)
         let entering_interface = !visible;
-        INTERFACE_MODE.store(entering_interface, Ordering::SeqCst);
+        INTERFACE_MODE.store(entering_interface, Ordering::Relaxed);
         info!(
             "[window_layer] Mode switch: {}",
             if entering_interface { "INTERFACE" } else { "WALLPAPER" }
@@ -669,6 +669,8 @@ pub mod mouse_hook {
     static DBLCLICK_TIME: AtomicU32 = AtomicU32::new(0);
     static DBLCLICK_CX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static DBLCLICK_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static DRAG_THRESHOLD_CX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(4);
+    static DRAG_THRESHOLD_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(4);
     // Left-click drag state (icon repositioning via LVM_SETITEMPOSITION)
     static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static DRAG_START_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -949,13 +951,17 @@ pub mod mouse_hook {
         get_hit_item_index(slv, screen_pt) >= 0
     }
 
-    /// Same as hit_test_icon but returns the item index (-1 if no item).
-    unsafe fn get_hit_item_index(
+    /// Execute a cross-process ListView message with a remote buffer.
+    /// Writes `input` to explorer's address space, sends the message, reads `output`.
+    /// Returns the SendMessage result (0 on failure).
+    unsafe fn cross_process_lvm_send<T>(
         slv: HWND,
-        screen_pt: &windows::Win32::Foundation::POINT,
-    ) -> i32 {
+        msg: u32,
+        wparam: WPARAM,
+        input: &T,
+        output: &mut T,
+    ) -> usize {
         use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::Graphics::Gdi::ScreenToClient;
         use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
         use windows::Win32::System::Memory::{
             VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
@@ -963,6 +969,59 @@ pub mod mouse_hook {
         use windows::Win32::System::Threading::{
             OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
         };
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(slv, Some(&mut pid));
+        if pid == 0 {
+            return 0;
+        }
+
+        let proc = match OpenProcess(
+            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+            false,
+            pid,
+        ) {
+            Ok(h) => h,
+            Err(_) => return 0,
+        };
+
+        let size = std::mem::size_of::<T>();
+        let remote = VirtualAllocEx(proc, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if remote.is_null() {
+            let _ = CloseHandle(proc);
+            return 0;
+        }
+
+        if WriteProcessMemory(proc, remote, input as *const T as _, size, None).is_err() {
+            let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+            let _ = CloseHandle(proc);
+            return 0;
+        }
+
+        let mut result: usize = 0;
+        let _ = SendMessageTimeoutW(
+            slv,
+            msg,
+            wparam,
+            LPARAM(remote as isize),
+            SMTO_ABORTIFHUNG,
+            100,
+            Some(&mut result),
+        );
+
+        let _ = ReadProcessMemory(proc, remote, output as *mut T as _, size, None);
+        let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+        let _ = CloseHandle(proc);
+
+        result
+    }
+
+    /// Returns the item index under screen_pt (-1 if no item).
+    unsafe fn get_hit_item_index(
+        slv: HWND,
+        screen_pt: &windows::Win32::Foundation::POINT,
+    ) -> i32 {
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
 
         let mut pt = *screen_pt;
         let _ = ScreenToClient(slv, &mut pt);
@@ -976,125 +1035,42 @@ pub mod mouse_hook {
             i_group: i32,
         }
 
-        let ht = LVHITTESTINFO {
+        let input = LVHITTESTINFO {
             pt,
             flags: 0,
             i_item: -1,
             i_sub_item: 0,
             i_group: 0,
         };
-
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(slv, Some(&mut pid));
-        if pid == 0 {
-            return -1;
-        }
-
-        let proc = match OpenProcess(
-            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
-            false,
-            pid,
-        ) {
-            Ok(h) => h,
-            Err(_) => return -1,
-        };
-
-        let size = std::mem::size_of::<LVHITTESTINFO>();
-        let remote = VirtualAllocEx(proc, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if remote.is_null() {
-            let _ = CloseHandle(proc);
-            return -1;
-        }
-
-        if WriteProcessMemory(proc, remote, &ht as *const _ as _, size, None).is_err() {
-            let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-            let _ = CloseHandle(proc);
-            return -1;
-        }
-
-        let _ = SendMessageTimeoutW(
-            slv,
-            LVM_HITTEST,
-            WPARAM(0),
-            LPARAM(remote as isize),
-            SMTO_ABORTIFHUNG,
-            100,
-            None,
-        );
-
-        let mut ht_out = LVHITTESTINFO {
+        let mut output = LVHITTESTINFO {
             pt: windows::Win32::Foundation::POINT { x: 0, y: 0 },
             flags: 0,
             i_item: -1,
             i_sub_item: 0,
             i_group: 0,
         };
-        let _ = ReadProcessMemory(proc, remote, &mut ht_out as *mut _ as _, size, None);
-        let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-        let _ = CloseHandle(proc);
 
-        ht_out.i_item
+        cross_process_lvm_send(slv, LVM_HITTEST, WPARAM(0), &input, &mut output);
+        output.i_item
     }
 
-    /// Get icon position (client coords) in SysListView32 via LVM_GETITEMPOSITION.
+    /// Get icon position (client coords) via LVM_GETITEMPOSITION.
     unsafe fn get_item_position(
         slv: HWND,
         item_index: i32,
     ) -> Option<windows::Win32::Foundation::POINT> {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-        use windows::Win32::System::Memory::{
-            VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
-        };
-        use windows::Win32::System::Threading::{
-            OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
-        };
+        let input = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+        let mut output = windows::Win32::Foundation::POINT { x: 0, y: 0 };
 
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(slv, Some(&mut pid));
-        if pid == 0 {
-            return None;
-        }
-
-        let proc = OpenProcess(
-            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
-            false,
-            pid,
-        )
-        .ok()?;
-
-        let size = std::mem::size_of::<windows::Win32::Foundation::POINT>();
-        let remote = VirtualAllocEx(proc, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if remote.is_null() {
-            let _ = CloseHandle(proc);
-            return None;
-        }
-
-        // Initialiser à zéro
-        let zero_pt = windows::Win32::Foundation::POINT { x: 0, y: 0 };
-        let _ = WriteProcessMemory(proc, remote, &zero_pt as *const _ as _, size, None);
-
-        let mut result: usize = 0;
-        let _ = SendMessageTimeoutW(
+        let result = cross_process_lvm_send(
             slv,
             LVM_GETITEMPOSITION,
             WPARAM(item_index as usize),
-            LPARAM(remote as isize),
-            SMTO_ABORTIFHUNG,
-            100,
-            Some(&mut result),
+            &input,
+            &mut output,
         );
 
-        let mut pt_out = windows::Win32::Foundation::POINT { x: 0, y: 0 };
-        let _ = ReadProcessMemory(proc, remote, &mut pt_out as *mut _ as _, size, None);
-        let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-        let _ = CloseHandle(proc);
-
-        if result != 0 {
-            Some(pt_out)
-        } else {
-            None
-        }
+        if result != 0 { Some(output) } else { None }
     }
 
     #[inline]
@@ -1161,6 +1137,8 @@ pub mod mouse_hook {
                 DBLCLICK_TIME.store(GetDoubleClickTime(), Ordering::Relaxed);
                 DBLCLICK_CX.store(GetSystemMetrics(SM_CXDOUBLECLK) / 2, Ordering::Relaxed);
                 DBLCLICK_CY.store(GetSystemMetrics(SM_CYDOUBLECLK) / 2, Ordering::Relaxed);
+                DRAG_THRESHOLD_CX.store(GetSystemMetrics(SM_CXDRAG), Ordering::Relaxed);
+                DRAG_THRESHOLD_CY.store(GetSystemMetrics(SM_CYDRAG), Ordering::Relaxed);
             }
 
             /// Post a mouse event to SysListView32, with double-click synthesis and key state.
@@ -1302,8 +1280,8 @@ pub mod mouse_hook {
                         let start_y = DRAG_START_Y.load(Ordering::Relaxed);
                         let dx = (info_hook.pt.x - start_x).abs();
                         let dy = (info_hook.pt.y - start_y).abs();
-                        let drag_cx = GetSystemMetrics(SM_CXDRAG);
-                        let drag_cy = GetSystemMetrics(SM_CYDRAG);
+                        let drag_cx = DRAG_THRESHOLD_CX.load(Ordering::Relaxed);
+                        let drag_cy = DRAG_THRESHOLD_CY.load(Ordering::Relaxed);
 
                         if dx > drag_cx || dy > drag_cy {
                             let item_idx = DRAG_ITEM_INDEX.load(Ordering::Relaxed);
@@ -1341,8 +1319,8 @@ pub mod mouse_hook {
                         let start_y = DRAG_START_Y.load(Ordering::Relaxed);
                         let dx = (info_hook.pt.x - start_x).abs();
                         let dy = (info_hook.pt.y - start_y).abs();
-                        let drag_cx = GetSystemMetrics(SM_CXDRAG);
-                        let drag_cy = GetSystemMetrics(SM_CYDRAG);
+                        let drag_cx = DRAG_THRESHOLD_CX.load(Ordering::Relaxed);
+                        let drag_cy = DRAG_THRESHOLD_CY.load(Ordering::Relaxed);
                         if (dx > drag_cx || dy > drag_cy) && slv_raw != 0 {
                             let item_idx = DRAG_ITEM_INDEX.load(Ordering::Relaxed);
                             if item_idx >= 0 {

@@ -201,10 +201,10 @@ fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> Syst
             disks
                 .iter()
                 .map(|d| DiskInfo {
-                    name: d.name().to_string_lossy().to_string(),
+                    name: d.name().to_string_lossy().into_owned(),
                     total: d.total_space(),
                     available: d.available_space(),
-                    fs: d.file_system().to_string_lossy().to_string(),
+                    fs: d.file_system().to_string_lossy().into_owned(),
                 })
                 .collect(),
         );
