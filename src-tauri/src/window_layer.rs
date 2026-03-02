@@ -662,6 +662,7 @@ pub mod mouse_hook {
     const LVM_SETITEMPOSITION: u32 = LVM_FIRST + 15; // 0x100F
     const LVM_GETITEMPOSITION: u32 = LVM_FIRST + 16; // 0x1010
     const LVM_HITTEST: u32 = LVM_FIRST + 18; // 0x1012
+    const LVM_GETITEMRECT: u32 = LVM_FIRST + 14; // 0x100E
     const LVM_SETHOTITEM: u32 = LVM_FIRST + 60; // 0x103C
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -689,6 +690,9 @@ pub mod mouse_hook {
     static DRAG_ITEM_INDEX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
     static DRAG_OFFSET_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static DRAG_OFFSET_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static DRAG_PAST_THRESHOLD: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static DRAG_GHOST_HIML: AtomicIsize = AtomicIsize::new(0);
     // Right-click state (context menu — PostMessage doesn't trigger native WM_CONTEXTMENU)
     static RCLICK_ON_ICON: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -1084,6 +1088,127 @@ pub mod mouse_hook {
         if result != 0 { Some(output) } else { None }
     }
 
+    /// Get item bounding rect (client coords) via LVM_GETITEMRECT.
+    unsafe fn get_item_rect(
+        slv: HWND,
+        item_index: i32,
+    ) -> Option<windows::Win32::Foundation::RECT> {
+        use windows::Win32::Foundation::RECT;
+        // lParam = RECT*, rect.left = part type (LVIR_BOUNDS = 0)
+        let input = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let mut output = input;
+        let result = cross_process_lvm_send(
+            slv,
+            LVM_GETITEMRECT,
+            WPARAM(item_index as usize),
+            &input,
+            &mut output,
+        );
+        if result != 0 {
+            Some(output)
+        } else {
+            None
+        }
+    }
+
+    /// Begin ImageList ghost drag: capture icon area from screen, show as drag overlay.
+    unsafe fn start_drag_ghost(
+        slv: HWND,
+        item_idx: i32,
+        cursor: &windows::Win32::Foundation::POINT,
+    ) {
+        use windows::Win32::Graphics::Gdi::{
+            BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
+            DeleteObject, GetDC, ReleaseDC, SelectObject, HBITMAP, SRCCOPY,
+        };
+        use windows::Win32::UI::Controls::{
+            ImageList_Add, ImageList_BeginDrag, ImageList_Create, ImageList_DragEnter, ILC_COLOR32,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+
+        let item_rect = match get_item_rect(slv, item_idx) {
+            Some(r) => r,
+            None => return,
+        };
+        let w = item_rect.right - item_rect.left;
+        let h = item_rect.bottom - item_rect.top;
+        if w <= 0 || h <= 0 {
+            return;
+        }
+
+        // Convert item rect top-left to screen coords
+        let mut tl = windows::Win32::Foundation::POINT {
+            x: item_rect.left,
+            y: item_rect.top,
+        };
+        let _ = ClientToScreen(slv, &mut tl);
+
+        // Capture icon area from screen DC
+        let screen_dc = GetDC(None);
+        if screen_dc.is_invalid() {
+            return;
+        }
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        let bmp = CreateCompatibleBitmap(screen_dc, w, h);
+        let old = SelectObject(mem_dc, bmp);
+        let _ = BitBlt(mem_dc, 0, 0, w, h, screen_dc, tl.x, tl.y, SRCCOPY);
+        let _ = SelectObject(mem_dc, old);
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+
+        // Create ImageList with captured bitmap
+        let himl = ImageList_Create(w, h, ILC_COLOR32, 1, 0);
+        if himl.is_invalid() {
+            let _ = DeleteObject(bmp);
+            return;
+        }
+        ImageList_Add(himl, bmp, HBITMAP::default());
+        let _ = DeleteObject(bmp);
+
+        // Hotspot = cursor offset within captured image
+        let hotspot_x = cursor.x - tl.x;
+        let hotspot_y = cursor.y - tl.y;
+
+        let _ = ImageList_BeginDrag(himl, 0, hotspot_x, hotspot_y);
+        let _ = ImageList_DragEnter(GetDesktopWindow(), cursor.x, cursor.y);
+        DRAG_GHOST_HIML.store(himl.0 as isize, Ordering::Relaxed);
+        log::debug!(
+            "[hook] Ghost drag started: {}x{} hotspot({},{})",
+            w,
+            h,
+            hotspot_x,
+            hotspot_y
+        );
+    }
+
+    /// Move the ghost drag image to follow the cursor.
+    #[inline]
+    unsafe fn move_drag_ghost(cursor: &windows::Win32::Foundation::POINT) {
+        let _ = windows::Win32::UI::Controls::ImageList_DragMove(cursor.x, cursor.y);
+    }
+
+    /// End the ghost drag: cleanup ImageList resources.
+    unsafe fn end_drag_ghost() {
+        use windows::Win32::UI::Controls::{
+            ImageList_DragLeave, ImageList_Destroy, ImageList_EndDrag, HIMAGELIST,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+
+        let _ = ImageList_DragLeave(GetDesktopWindow());
+        ImageList_EndDrag();
+
+        let himl_raw = DRAG_GHOST_HIML.swap(0, Ordering::Relaxed);
+        if himl_raw != 0 {
+            let himl = HIMAGELIST(himl_raw as *mut _);
+            let _ = ImageList_Destroy(himl);
+        }
+    }
+
     #[inline]
     unsafe fn forward(msg: u32, info_hook: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
         match msg {
@@ -1281,20 +1406,16 @@ pub mod mouse_hook {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // ── Left-click drag (icon repositioning) ──
-                // Only left-click initiates drag. On button-up: if moved past
-                // threshold, LVM_SETITEMPOSITION to reposition the icon.
+                // ── Left-click drag (icon repositioning with ghost image) ──
+                // Ghost follows cursor via ImageList drag APIs. Only a single
+                // LVM_SETITEMPOSITION fires at drop time (no grid-jumping).
                 if NATIVE_DRAG.load(Ordering::Relaxed) {
                     if msg == WM_LBUTTONUP {
                         NATIVE_DRAG.store(false, Ordering::Relaxed);
-                        let start_x = DRAG_START_X.load(Ordering::Relaxed);
-                        let start_y = DRAG_START_Y.load(Ordering::Relaxed);
-                        let dx = (info_hook.pt.x - start_x).abs();
-                        let dy = (info_hook.pt.y - start_y).abs();
-                        let drag_cx = DRAG_THRESHOLD_CX.load(Ordering::Relaxed);
-                        let drag_cy = DRAG_THRESHOLD_CY.load(Ordering::Relaxed);
+                        let was_dragging = DRAG_PAST_THRESHOLD.swap(false, Ordering::Relaxed);
 
-                        if dx > drag_cx || dy > drag_cy {
+                        if was_dragging {
+                            end_drag_ghost();
                             let item_idx = DRAG_ITEM_INDEX.load(Ordering::Relaxed);
                             if slv_raw != 0 && item_idx >= 0 {
                                 let slv_h = HWND(slv_raw as *mut _);
@@ -1325,32 +1446,29 @@ pub mod mouse_hook {
                             }
                         }
                     } else if msg == WM_MOUSEMOVE {
-                        // Live icon tracking during drag with grab offset
                         let start_x = DRAG_START_X.load(Ordering::Relaxed);
                         let start_y = DRAG_START_Y.load(Ordering::Relaxed);
                         let dx = (info_hook.pt.x - start_x).abs();
                         let dy = (info_hook.pt.y - start_y).abs();
                         let drag_cx = DRAG_THRESHOLD_CX.load(Ordering::Relaxed);
                         let drag_cy = DRAG_THRESHOLD_CY.load(Ordering::Relaxed);
-                        if (dx > drag_cx || dy > drag_cy) && slv_raw != 0 {
-                            let item_idx = DRAG_ITEM_INDEX.load(Ordering::Relaxed);
-                            if item_idx >= 0 {
-                                let slv_h = HWND(slv_raw as *mut _);
-                                let mut cp = info_hook.pt;
-                                let _ = ScreenToClient(slv_h, &mut cp);
-                                let off_x = DRAG_OFFSET_X.load(Ordering::Relaxed);
-                                let off_y = DRAG_OFFSET_Y.load(Ordering::Relaxed);
-                                cp.x -= off_x;
-                                cp.y -= off_y;
-                                let lp = ((cp.x as i16 as u16 as u32)
-                                    | ((cp.y as i16 as u16 as u32) << 16))
-                                    as isize;
-                                let _ = PostMessageW(
-                                    slv_h,
-                                    LVM_SETITEMPOSITION,
-                                    WPARAM(item_idx as usize),
-                                    LPARAM(lp),
-                                );
+                        if dx > drag_cx || dy > drag_cy {
+                            if !DRAG_PAST_THRESHOLD.load(Ordering::Relaxed) {
+                                // First move past threshold → start ghost overlay
+                                DRAG_PAST_THRESHOLD.store(true, Ordering::Relaxed);
+                                if slv_raw != 0 {
+                                    let item_idx = DRAG_ITEM_INDEX.load(Ordering::Relaxed);
+                                    if item_idx >= 0 {
+                                        start_drag_ghost(
+                                            HWND(slv_raw as *mut _),
+                                            item_idx,
+                                            &info_hook.pt,
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Subsequent moves → update ghost position
+                                move_drag_ghost(&info_hook.pt);
                             }
                         }
                     } else {
@@ -1408,6 +1526,7 @@ pub mod mouse_hook {
                         if msg == WM_LBUTTONDOWN {
                             // Left-click: initiate drag tracking
                             NATIVE_DRAG.store(true, Ordering::Relaxed);
+                            DRAG_PAST_THRESHOLD.store(false, Ordering::Relaxed);
                             DRAG_START_X.store(info_hook.pt.x, Ordering::Relaxed);
                             DRAG_START_Y.store(info_hook.pt.y, Ordering::Relaxed);
                             let item_idx = get_hit_item_index(slv_h, &info_hook.pt);
