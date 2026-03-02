@@ -1236,23 +1236,30 @@ pub mod mouse_hook {
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
 
                 // ── Active native drag (icon): hybride post_to_slv + CallNextHookEx ──
-                // WM_MOUSEMOVE: JUSTE CallNextHookEx (pas de PostMessage !)
-                //   → SetCapture redirige les hardware messages vers SysListView32
-                //   → LISTVIEW_TrackMouse détecte le mouvement pour le drag
-                // Button-down/up: post_to_slv (nécessaire sur Win11, XamlExplorer ne forwarde pas)
                 if NATIVE_DRAG.load(Ordering::Relaxed) {
                     if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
                         NATIVE_DRAG.store(false, Ordering::Relaxed);
+                        log::info!("[hook] NATIVE_DRAG end (button-up) at ({},{})", info_hook.pt.x, info_hook.pt.y);
                         if slv_raw != 0 {
                             post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                         }
-                    } else if msg != WM_MOUSEMOVE {
-                        // Autres button events (double-click, etc) → post
+                    } else if msg == WM_MOUSEMOVE {
+                        // Compteur de mousemove pendant le drag
+                        static DRAG_MOVE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        let c = DRAG_MOVE_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if c == 0 || c % 20 == 0 {
+                            // Log l'hwnd qui va recevoir le hardware message
+                            log::info!(
+                                "[hook] NATIVE_DRAG move #{} at ({},{}) hwnd_under={:#x?}",
+                                c, info_hook.pt.x, info_hook.pt.y, hwnd_under.0
+                            );
+                        }
+                    } else {
+                        log::info!("[hook] NATIVE_DRAG event msg={:#x} at ({},{})", msg, info_hook.pt.x, info_hook.pt.y);
                         if slv_raw != 0 {
                             post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                         }
                     }
-                    // WM_MOUSEMOVE: juste CallNextHookEx (hardware messages pour le drag)
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
@@ -1302,6 +1309,10 @@ pub mod mouse_hook {
                 if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) && slv_raw != 0 {
                     if hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt) {
                         NATIVE_DRAG.store(true, Ordering::Relaxed);
+                        log::info!(
+                            "[hook] NATIVE_DRAG start at ({},{}) msg={:#x} slv={:#x}",
+                            info_hook.pt.x, info_hook.pt.y, msg, slv_raw
+                        );
                         post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                         return CallNextHookEx(hook_h, code, wparam, lparam);
                     }
