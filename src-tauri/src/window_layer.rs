@@ -675,6 +675,9 @@ pub mod mouse_hook {
     static DBLCLICK_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static ZORDER_ANCHOR: AtomicIsize = AtomicIsize::new(0);
     static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static DRAG_START_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static DRAG_START_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static DRAG_ITEM_INDEX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
     pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -1058,6 +1061,95 @@ pub mod mouse_hook {
         ht_out.i_item >= 0
     }
 
+    /// Same as hit_test_icon but returns the item index (-1 if no item).
+    unsafe fn get_hit_item_index(
+        slv: HWND,
+        screen_pt: &windows::Win32::Foundation::POINT,
+    ) -> i32 {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+        use windows::Win32::System::Memory::{
+            VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+        };
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+        };
+
+        let mut pt = *screen_pt;
+        let _ = ScreenToClient(slv, &mut pt);
+
+        const LVM_HITTEST: u32 = 0x1000 + 18;
+
+        #[repr(C)]
+        struct LVHITTESTINFO {
+            pt: windows::Win32::Foundation::POINT,
+            flags: u32,
+            i_item: i32,
+            i_sub_item: i32,
+            i_group: i32,
+        }
+
+        let ht = LVHITTESTINFO {
+            pt,
+            flags: 0,
+            i_item: -1,
+            i_sub_item: 0,
+            i_group: 0,
+        };
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(slv, Some(&mut pid));
+        if pid == 0 {
+            return -1;
+        }
+
+        let proc = match OpenProcess(
+            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+            false,
+            pid,
+        ) {
+            Ok(h) => h,
+            Err(_) => return -1,
+        };
+
+        let size = std::mem::size_of::<LVHITTESTINFO>();
+        let remote = VirtualAllocEx(proc, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if remote.is_null() {
+            let _ = CloseHandle(proc);
+            return -1;
+        }
+
+        if WriteProcessMemory(proc, remote, &ht as *const _ as _, size, None).is_err() {
+            let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+            let _ = CloseHandle(proc);
+            return -1;
+        }
+
+        let _ = SendMessageTimeoutW(
+            slv,
+            LVM_HITTEST,
+            WPARAM(0),
+            LPARAM(remote as isize),
+            SMTO_ABORTIFHUNG,
+            100,
+            None,
+        );
+
+        let mut ht_out = LVHITTESTINFO {
+            pt: windows::Win32::Foundation::POINT { x: 0, y: 0 },
+            flags: 0,
+            i_item: -1,
+            i_sub_item: 0,
+            i_group: 0,
+        };
+        let _ = ReadProcessMemory(proc, remote, &mut ht_out as *mut _ as _, size, None);
+        let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+        let _ = CloseHandle(proc);
+
+        ht_out.i_item
+    }
+
     #[inline]
     unsafe fn forward(msg: u32, info_hook: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
         match msg {
@@ -1254,23 +1346,56 @@ pub mod mouse_hook {
                 let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
 
-                // ── Active native drag (icon): pur CallNextHookEx ──
-                // Chrome_RWHH a WS_EX_TRANSPARENT → hardware messages passent à travers
-                // via WM_NCHITTEST(HTTRANSPARENT) → XamlExplorer/SysListView32 les reçoit.
-                // PAS de post_to_slv (PostMessage ne met pas à jour GetKeyState →
-                // LISTVIEW_TrackMouse ne détecte pas le drag).
+                // ── Active native drag (icon) ──
+                // post_to_slv pour button events (clics, double-clic, rename marchent).
+                // WM_MOUSEMOVE: PAS de post (inutile + pollue la queue).
+                // Sur button-up: si déplacement > seuil, LVM_SETITEMPOSITION pour
+                // repositionner l'icône (le drag natif ne marche pas via PostMessage
+                // car LISTVIEW_TrackMouse nécessite des vrais hardware messages).
                 if NATIVE_DRAG.load(Ordering::Relaxed) {
                     if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
                         NATIVE_DRAG.store(false, Ordering::Relaxed);
-                        log::info!("[hook] NATIVE_DRAG end (button-up) at ({},{})", info_hook.pt.x, info_hook.pt.y);
+                        let start_x = DRAG_START_X.load(Ordering::Relaxed);
+                        let start_y = DRAG_START_Y.load(Ordering::Relaxed);
+                        let dx = (info_hook.pt.x - start_x).abs();
+                        let dy = (info_hook.pt.y - start_y).abs();
+                        let drag_cx = GetSystemMetrics(SM_CXDRAG);
+                        let drag_cy = GetSystemMetrics(SM_CYDRAG);
+
+                        if dx > drag_cx || dy > drag_cy {
+                            // Drag détecté → repositionner l'icône via LVM_SETITEMPOSITION
+                            let item_idx = DRAG_ITEM_INDEX.load(Ordering::Relaxed);
+                            if slv_raw != 0 && item_idx >= 0 {
+                                let slv_h = HWND(slv_raw as *mut _);
+                                let mut drop_pt = info_hook.pt;
+                                let _ = ScreenToClient(slv_h, &mut drop_pt);
+                                const LVM_SETITEMPOSITION: u32 = 0x100F;
+                                let lp = ((drop_pt.x as i16 as u16 as u32)
+                                    | ((drop_pt.y as i16 as u16 as u32) << 16))
+                                    as isize;
+                                let _ = PostMessageW(
+                                    slv_h,
+                                    LVM_SETITEMPOSITION,
+                                    WPARAM(item_idx as usize),
+                                    LPARAM(lp),
+                                );
+                                log::info!(
+                                    "[hook] DRAG complete: item={} from ({},{}) to client({},{})",
+                                    item_idx, start_x, start_y, drop_pt.x, drop_pt.y
+                                );
+                            }
+                        } else {
+                            // Simple clic (pas de drag) → forward button-up à SysListView32
+                            if slv_raw != 0 {
+                                post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
+                            }
+                        }
                     } else if msg == WM_MOUSEMOVE {
-                        static DRAG_MOVE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                        let c = DRAG_MOVE_COUNT.fetch_add(1, Ordering::Relaxed);
-                        if c == 0 || c % 20 == 0 {
-                            log::info!(
-                                "[hook] NATIVE_DRAG move #{} at ({},{}) hwnd_under={:#x?}",
-                                c, info_hook.pt.x, info_hook.pt.y, hwnd_under.0
-                            );
+                        // Pas de post pour mousemove — juste pass through
+                    } else {
+                        // Autres button events durant drag → post
+                        if slv_raw != 0 {
+                            post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                         }
                     }
                     return CallNextHookEx(hook_h, code, wparam, lparam);
@@ -1315,23 +1440,20 @@ pub mod mouse_hook {
                 }
 
                 // ── Wallpaper mode: button-down on icon → NATIVE_DRAG ──
-                // Pur CallNextHookEx: Chrome_RWHH a WS_EX_TRANSPARENT, donc les
-                // hardware messages passent à travers vers XamlExplorer/SysListView32.
-                // Pas de post_to_slv: ça ne met pas à jour GetKeyState, bloque le drag.
+                // post_to_slv pour le clic initial (sélection, double-clic).
+                // Enregistrer position de départ et index item pour le drag.
                 if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) && slv_raw != 0 {
                     if hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt) {
                         NATIVE_DRAG.store(true, Ordering::Relaxed);
-                        // Vérifier l'état de WS_EX_TRANSPARENT sur Chrome_RWHH
-                        let rwhh = CHROME_RWHH.load(Ordering::Relaxed);
-                        let has_trans = if rwhh != 0 {
-                            let ex = GetWindowLongPtrW(HWND(rwhh as *mut _), GWL_EXSTYLE);
-                            (ex & (WS_EX_TRANSPARENT.0 as isize)) != 0
-                        } else {
-                            false
-                        };
+                        DRAG_START_X.store(info_hook.pt.x, Ordering::Relaxed);
+                        DRAG_START_Y.store(info_hook.pt.y, Ordering::Relaxed);
+                        // Récupérer l'index de l'item sous le curseur
+                        let item_idx = get_hit_item_index(HWND(slv_raw as *mut _), &info_hook.pt);
+                        DRAG_ITEM_INDEX.store(item_idx, Ordering::Relaxed);
+                        post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                         log::info!(
-                            "[hook] NATIVE_DRAG start at ({},{}) msg={:#x} rwhh_transparent={}",
-                            info_hook.pt.x, info_hook.pt.y, msg, has_trans
+                            "[hook] NATIVE_DRAG start at ({},{}) item={}",
+                            info_hook.pt.x, info_hook.pt.y, item_idx
                         );
                         return CallNextHookEx(hook_h, code, wparam, lparam);
                     }
