@@ -624,9 +624,6 @@ pub mod mouse_hook {
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
-    static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static INJECTING_FOR_DRAG: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
     #[allow(dead_code)]
     static THREADS_ATTACHED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -1188,107 +1185,55 @@ pub mod mouse_hook {
                 let msg = wparam.0 as u32;
                 let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
 
-                // ── Active native drag: forward to SysListView32, skip webview ──
-                if NATIVE_DRAG.load(Ordering::Relaxed) {
-                    // If this event was injected by us via SendInput, let it pass through
-                    // to the real input stream (SysListView32 will receive it naturally).
-                    if INJECTING_FOR_DRAG.load(Ordering::Relaxed) {
-                        return CallNextHookEx(hook_h, code, wparam, lparam);
-                    }
-
-                    if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
-                        NATIVE_DRAG.store(false, Ordering::Relaxed);
-                    }
-
-                    // CRITICAL FIX: PostMessageW doesn't update the real cursor position,
-                    // so DragDetect() (which calls GetCursorPos internally) sees no movement.
-                    // Fix: use SendInput() to re-inject mouse events into the real input
-                    // stream. The INJECTING_FOR_DRAG flag prevents re-entrant hook firing.
-                    // The re-injected event bypasses our hook (INJECTING=true) and flows
-                    // naturally to SysListView32 so DragDetect() and DoDragDrop() work.
-                    INJECTING_FOR_DRAG.store(true, Ordering::Relaxed);
-                    unsafe {
-                        use windows::Win32::UI::Input::KeyboardAndMouse::{
-                            SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE,
-                            MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
-                            MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-                        };
-                        // Convert screen coords to normalized absolute (0..65535)
-                        let screen_w = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                            windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
-                        ) as f64;
-                        let screen_h = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-                            windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
-                        ) as f64;
-                        let nx = ((info_hook.pt.x as f64 + 0.5) * 65536.0 / screen_w) as i32;
-                        let ny = ((info_hook.pt.y as f64 + 0.5) * 65536.0 / screen_h) as i32;
-
-                        let flags =
-                            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | match msg {
-                                WM_LBUTTONDOWN => MOUSEEVENTF_LEFTDOWN,
-                                WM_LBUTTONUP => MOUSEEVENTF_LEFTUP,
-                                WM_RBUTTONDOWN => MOUSEEVENTF_RIGHTDOWN,
-                                WM_RBUTTONUP => MOUSEEVENTF_RIGHTUP,
-                                _ => {
-                                    windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS(
-                                        0,
-                                    )
-                                }
+                // ── Helper: set/restore WS_EX_TRANSPARENT on the webview windows ──
+                // When transparent, mouse events pass through to SysListView32 below.
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
+                };
+                let set_icon_passthrough = |on: bool| {
+                    for raw in [
+                        WEBVIEW_HWND.load(Ordering::Relaxed),
+                        CHROME_RWHH.load(Ordering::Relaxed),
+                    ] {
+                        if raw != 0 {
+                            let ex = GetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE);
+                            let new_ex = if on {
+                                ex | WS_EX_TRANSPARENT.0 as isize
+                            } else {
+                                ex & !(WS_EX_TRANSPARENT.0 as isize)
                             };
-                        let mut input = INPUT {
-                            r#type: INPUT_MOUSE,
-                            ..Default::default()
-                        };
-                        input.Anonymous.mi.dx = nx;
-                        input.Anonymous.mi.dy = ny;
-                        input.Anonymous.mi.dwFlags = flags;
-                        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+                            if new_ex != ex {
+                                SetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE, new_ex);
+                            }
+                        }
                     }
-                    INJECTING_FOR_DRAG.store(false, Ordering::Relaxed);
-
-                    // Consume the original event so Chrome doesn't interfere.
-                    return LRESULT(1);
-                }
+                };
 
                 // ── Not over desktop: pass through ──
                 if !is_over_desktop(hwnd_under) {
+                    set_icon_passthrough(false);
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // ── On desktop: check if button-down is on an icon ──
-                if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) && slv_raw != 0 {
-                    log::info!(
-                        "[hook] BTNDOWN pt=({},{}) hwnd=0x{:X} slv=0x{:X}",
-                        info_hook.pt.x,
-                        info_hook.pt.y,
-                        hwnd_under.0 as isize,
-                        slv_raw,
-                    );
+                // ── Check if cursor is over a desktop icon ──
+                let over_icon =
+                    slv_raw != 0 && hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt);
 
-                    if hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt) {
-                        NATIVE_DRAG.store(true, Ordering::Relaxed);
-                        log::info!(
-                            "[hook] Icon hit → NATIVE_DRAG, pt=({},{})",
-                            info_hook.pt.x,
-                            info_hook.pt.y,
-                        );
-                        post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
-                        // Consume: Chrome must not see the click (SetCapture/
-                        // SetFocus would steal the gesture from SysListView32).
-                        return LRESULT(1);
-                    }
+                if over_icon {
+                    // Make webview transparent → real OS events flow to SysListView32.
+                    // This enables: proper hover highlight, selection, DragDetect(),
+                    // DoDragDrop(), rename, double-click — all natively.
+                    set_icon_passthrough(true);
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // ── Normal desktop interaction (wallpaper) ──
+                // ── Not over an icon: restore opacity, handle as wallpaper ──
+                set_icon_passthrough(false);
+
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(HWND(wv_raw as *mut _), &mut cp);
                 forward(msg, &info_hook, cp.x, cp.y);
-
-                // PostMessageW fallback when native delivery won't reach SysListView32
-                if (hwnd_under.0 as isize) != slv_raw && slv_raw != 0 {
-                    post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
-                }
 
                 CallNextHookEx(hook_h, code, wparam, lparam)
             }
