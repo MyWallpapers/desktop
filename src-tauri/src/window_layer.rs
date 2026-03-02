@@ -10,6 +10,8 @@ static ICONS_RESTORED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static HOOK_HANDLE_GLOBAL: AtomicIsize = AtomicIsize::new(0);
 #[cfg(target_os = "windows")]
+static KB_HOOK_HANDLE_GLOBAL: AtomicIsize = AtomicIsize::new(0);
+#[cfg(target_os = "windows")]
 static IS_SESSION_ACTIVE: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "windows")]
 static WATCHDOG_PARENT: AtomicIsize = AtomicIsize::new(0);
@@ -106,6 +108,15 @@ pub fn restore_desktop_icons_and_unhook() {
                 unsafe {
                     if let Err(e) = UnhookWindowsHookEx(HHOOK(hook_ptr as *mut _)) {
                         error!("[window_layer] Unhook mouse hook failed: {:?}", e);
+                    }
+                }
+            }
+
+            let kb_hook_ptr = KB_HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst);
+            if kb_hook_ptr != 0 {
+                unsafe {
+                    if let Err(e) = UnhookWindowsHookEx(HHOOK(kb_hook_ptr as *mut _)) {
+                        error!("[window_layer] Unhook keyboard hook failed: {:?}", e);
                     }
                 }
             }
@@ -623,7 +634,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
 }
 
 // ==============================================================================
-// Windows: Mouse Hook
+// Windows: Mouse & Keyboard Hooks
 // ==============================================================================
 
 #[cfg(target_os = "windows")]
@@ -1459,9 +1470,87 @@ pub mod mouse_hook {
                 CallNextHookEx(hook_h, code, wparam, lparam)
             }
 
+            /// Keyboard hook: forwards key events to Chrome_RWHH in interface mode.
+            /// Generates WM_CHAR via ToUnicode for text input in WebView fields.
+            unsafe extern "system" fn keyboard_hook_proc(
+                code: i32,
+                wparam: WPARAM,
+                lparam: LPARAM,
+            ) -> LRESULT {
+                let hook_h = HHOOK(
+                    crate::window_layer::KB_HOOK_HANDLE_GLOBAL.load(Ordering::Relaxed) as *mut _,
+                );
+
+                if code < 0 || !crate::window_layer::INTERFACE_MODE.load(Ordering::Relaxed) {
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
+
+                let rwhh = CHROME_RWHH.load(Ordering::Relaxed);
+                if rwhh == 0 {
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
+
+                let kb = *(lparam.0 as *const KBDLLHOOKSTRUCT);
+                let msg = wparam.0 as u32;
+                let rwhh_hwnd = HWND(rwhh as *mut _);
+
+                // Build lParam: repeat(0-15) | scanCode(16-23) | extended(24) |
+                //               context(29) | previous(30) | transition(31)
+                let extended = if kb.flags.0 & 0x01 != 0 { 1u32 } else { 0 };
+                let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+                let is_sys = msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP;
+                let lp = (1u32 // repeat count = 1
+                    | ((kb.scanCode & 0xFF) << 16)
+                    | (extended << 24)
+                    | (if is_sys { 1u32 << 29 } else { 0 })
+                    | (if is_up { 1u32 << 30 } else { 0 })
+                    | (if is_up { 1u32 << 31 } else { 0 })) as isize;
+
+                let _ = PostMessageW(
+                    rwhh_hwnd,
+                    msg,
+                    WPARAM(kb.vkCode as usize),
+                    LPARAM(lp),
+                );
+
+                // Generate WM_CHAR for key-down events (text input)
+                if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+                    use windows::Win32::UI::Input::KeyboardAndMouse::{
+                        GetKeyboardState, ToUnicode,
+                    };
+                    let mut kb_state = [0u8; 256];
+                    let _ = GetKeyboardState(&mut kb_state);
+                    let mut chars = [0u16; 4];
+                    let count = ToUnicode(
+                        kb.vkCode,
+                        kb.scanCode,
+                        Some(&kb_state),
+                        &mut chars,
+                        0,
+                    );
+                    let char_msg = if is_sys { WM_SYSCHAR } else { WM_CHAR };
+                    for i in 0..count.max(0) as usize {
+                        let _ = PostMessageW(
+                            rwhh_hwnd,
+                            char_msg,
+                            WPARAM(chars[i] as usize),
+                            LPARAM(lp),
+                        );
+                    }
+                }
+
+                CallNextHookEx(hook_h, code, wparam, lparam)
+            }
+
             unsafe {
                 if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) {
                     crate::window_layer::HOOK_HANDLE_GLOBAL.store(h.0 as isize, Ordering::SeqCst);
+                }
+                if let Ok(h) =
+                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0)
+                {
+                    crate::window_layer::KB_HOOK_HANDLE_GLOBAL
+                        .store(h.0 as isize, Ordering::SeqCst);
                 }
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
