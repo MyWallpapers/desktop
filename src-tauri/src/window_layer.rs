@@ -1236,21 +1236,23 @@ pub mod mouse_hook {
 
                         // Make the webview transparent to mouse events so that
                         // SysListView32 receives real mouse input directly.
-                        // DragDetect() and DoDragDrop() in Explorer will work
-                        // because they see real events, not PostMessageW copies.
-                        let wv = WEBVIEW_HWND.load(Ordering::Relaxed);
-                        if wv != 0 {
-                            use windows::Win32::UI::WindowsAndMessaging::{
-                                GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
-                                WS_EX_TRANSPARENT,
-                            };
-                            let ex = GetWindowLongPtrW(HWND(wv as *mut _), GWL_EXSTYLE);
-                            SetWindowLongPtrW(
-                                HWND(wv as *mut _),
-                                GWL_EXSTYLE,
-                                ex | WS_EX_TRANSPARENT.0 as isize,
-                            );
-                        }
+                        // Must apply to BOTH the Tauri parent window AND Chrome_RWHH
+                        // child — Chrome_RWHH is the actual window above SysListView32.
+                        use windows::Win32::UI::WindowsAndMessaging::{
+                            GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
+                        };
+                        let make_transparent = |h: isize| {
+                            if h != 0 {
+                                let ex = GetWindowLongPtrW(HWND(h as *mut _), GWL_EXSTYLE);
+                                SetWindowLongPtrW(
+                                    HWND(h as *mut _),
+                                    GWL_EXSTYLE,
+                                    ex | WS_EX_TRANSPARENT.0 as isize,
+                                );
+                            }
+                        };
+                        make_transparent(WEBVIEW_HWND.load(Ordering::Relaxed));
+                        make_transparent(CHROME_RWHH.load(Ordering::Relaxed));
 
                         // Pass the click through — webview is now transparent so
                         // SysListView32 will receive it as a real mouse event.
