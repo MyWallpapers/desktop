@@ -41,10 +41,7 @@ pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetWindowLongPtrW, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, SW_HIDE, SW_SHOW,
-            WS_EX_TRANSPARENT,
-        };
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
         let slv = mouse_hook::get_syslistview_hwnd();
         if slv != 0 {
             unsafe {
@@ -61,42 +58,10 @@ pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
             if entering_interface { "INTERFACE" } else { "WALLPAPER" }
         );
 
-        if entering_interface {
-            // Mode interface: strip WS_EX_TRANSPARENT pour que le webview reçoive les events
-            unsafe {
-                for raw in [
-                    mouse_hook::get_webview_hwnd_raw(),
-                    mouse_hook::get_chrome_rwhh_raw(),
-                ] {
-                    if raw != 0 {
-                        let ex = GetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE);
-                        let new_ex = ex & !(WS_EX_TRANSPARENT.0 as isize);
-                        if new_ex != ex {
-                            SetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE, new_ex);
-                            info!("[window_layer] Stripped WS_EX_TRANSPARENT from HWND {:#x}", raw);
-                        }
-                    }
-                }
-            }
-        } else {
-            // Mode wallpaper: RESTAURER WS_EX_TRANSPARENT pour que les events hardware
-            // passent à travers Chrome_RWHH vers SysListView32 (nécessaire pour drag icons)
-            unsafe {
-                for raw in [
-                    mouse_hook::get_webview_hwnd_raw(),
-                    mouse_hook::get_chrome_rwhh_raw(),
-                ] {
-                    if raw != 0 {
-                        let ex = GetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE);
-                        let new_ex = ex | (WS_EX_TRANSPARENT.0 as isize);
-                        if new_ex != ex {
-                            SetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE, new_ex);
-                            info!("[window_layer] Restored WS_EX_TRANSPARENT on HWND {:#x}", raw);
-                        }
-                    }
-                }
-            }
-        }
+        // NE PAS toucher WS_EX_TRANSPARENT : SetWindowLongPtrW provoque un relayout
+        // du shell Windows qui fait disparaître le WebView (même effet que set_icon_passthrough).
+        // Interface mode : PostMessage direct à Chrome_RWHH (bypass les styles fenêtre).
+        // Wallpaper mode : CallNextHookEx natif pour les icônes + forward() pour le webview.
     }
     Ok(())
 }
