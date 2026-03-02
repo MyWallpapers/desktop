@@ -1249,7 +1249,26 @@ pub mod mouse_hook {
                 };
 
                 // ── Not over desktop: pass through ──
-                if !is_over_desktop(hwnd_under) {
+                let over_desktop = is_over_desktop(hwnd_under);
+                if !over_desktop {
+                    // Log ce que WindowFromPoint retourne (1 log par seconde max)
+                    if msg == WM_MOUSEMOVE {
+                        use std::sync::atomic::AtomicI64;
+                        static LAST_LOG_MS: AtomicI64 = AtomicI64::new(0);
+                        let now = info_hook.time as i64;
+                        let prev = LAST_LOG_MS.load(Ordering::Relaxed);
+                        if now.wrapping_sub(prev) > 1000 {
+                            LAST_LOG_MS.store(now, Ordering::Relaxed);
+                            let mut cls_buf = [0u16; 64];
+                            let cls_len = GetClassNameW(hwnd_under, &mut cls_buf) as usize;
+                            let cls = String::from_utf16_lossy(&cls_buf[..cls_len]);
+                            log::info!(
+                                "[hook] NOT over desktop: hwnd=0x{:X} class='{}' pt=({},{}) interface={}",
+                                hwnd_under.0 as isize, cls, info_hook.pt.x, info_hook.pt.y,
+                                crate::window_layer::INTERFACE_MODE.load(Ordering::Relaxed)
+                            );
+                        }
+                    }
                     set_icon_passthrough(false);
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
