@@ -625,6 +625,8 @@ pub mod mouse_hook {
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
     static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static INJECTING_FOR_DRAG: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     #[allow(dead_code)]
     static THREADS_ATTACHED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -1186,29 +1188,66 @@ pub mod mouse_hook {
                 let msg = wparam.0 as u32;
                 let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
 
-                // ── Active native drag: pass through with webview transparent ──
+                // ── Active native drag: forward to SysListView32, skip webview ──
                 if NATIVE_DRAG.load(Ordering::Relaxed) {
+                    // If this event was injected by us via SendInput, let it pass through
+                    // to the real input stream (SysListView32 will receive it naturally).
+                    if INJECTING_FOR_DRAG.load(Ordering::Relaxed) {
+                        return CallNextHookEx(hook_h, code, wparam, lparam);
+                    }
+
                     if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
                         NATIVE_DRAG.store(false, Ordering::Relaxed);
-                        // Restore webview hit-testing on button up
-                        let wv = WEBVIEW_HWND.load(Ordering::Relaxed);
-                        if wv != 0 {
-                            use windows::Win32::UI::WindowsAndMessaging::WS_EX_TRANSPARENT;
-                            use windows::Win32::UI::WindowsAndMessaging::{
-                                GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
-                            };
-                            let ex = GetWindowLongPtrW(HWND(wv as *mut _), GWL_EXSTYLE);
-                            SetWindowLongPtrW(
-                                HWND(wv as *mut _),
-                                GWL_EXSTYLE,
-                                ex & !(WS_EX_TRANSPARENT.0 as isize),
-                            );
-                        }
                     }
-                    // Let the event pass through naturally to SysListView32.
-                    // The webview is WS_EX_TRANSPARENT so it won't receive clicks,
-                    // and DragDetect() / DoDragDrop() in Explorer work correctly.
-                    return CallNextHookEx(hook_h, code, wparam, lparam);
+
+                    // CRITICAL FIX: PostMessageW doesn't update the real cursor position,
+                    // so DragDetect() (which calls GetCursorPos internally) sees no movement.
+                    // Fix: use SendInput() to re-inject mouse events into the real input
+                    // stream. The INJECTING_FOR_DRAG flag prevents re-entrant hook firing.
+                    // The re-injected event bypasses our hook (INJECTING=true) and flows
+                    // naturally to SysListView32 so DragDetect() and DoDragDrop() work.
+                    INJECTING_FOR_DRAG.store(true, Ordering::Relaxed);
+                    unsafe {
+                        use windows::Win32::UI::Input::KeyboardAndMouse::{
+                            SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE,
+                            MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
+                            MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+                        };
+                        // Convert screen coords to normalized absolute (0..65535)
+                        let screen_w = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                            windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
+                        ) as f64;
+                        let screen_h = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                            windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
+                        ) as f64;
+                        let nx = ((info_hook.pt.x as f64 + 0.5) * 65536.0 / screen_w) as i32;
+                        let ny = ((info_hook.pt.y as f64 + 0.5) * 65536.0 / screen_h) as i32;
+
+                        let flags =
+                            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | match msg {
+                                WM_LBUTTONDOWN => MOUSEEVENTF_LEFTDOWN,
+                                WM_LBUTTONUP => MOUSEEVENTF_LEFTUP,
+                                WM_RBUTTONDOWN => MOUSEEVENTF_RIGHTDOWN,
+                                WM_RBUTTONUP => MOUSEEVENTF_RIGHTUP,
+                                _ => {
+                                    windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS(
+                                        0,
+                                    )
+                                }
+                            };
+                        let mut input = INPUT {
+                            r#type: INPUT_MOUSE,
+                            ..Default::default()
+                        };
+                        input.Anonymous.mi.dx = nx;
+                        input.Anonymous.mi.dy = ny;
+                        input.Anonymous.mi.dwFlags = flags;
+                        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+                    }
+                    INJECTING_FOR_DRAG.store(false, Ordering::Relaxed);
+
+                    // Consume the original event so Chrome doesn't interfere.
+                    return LRESULT(1);
                 }
 
                 // ── Not over desktop: pass through ──
@@ -1233,28 +1272,10 @@ pub mod mouse_hook {
                             info_hook.pt.x,
                             info_hook.pt.y,
                         );
-
-                        // Make the webview transparent to mouse events so that
-                        // SysListView32 receives real mouse input directly.
-                        // DragDetect() and DoDragDrop() in Explorer will work
-                        // because they see real events, not PostMessageW copies.
-                        let wv = WEBVIEW_HWND.load(Ordering::Relaxed);
-                        if wv != 0 {
-                            use windows::Win32::UI::WindowsAndMessaging::{
-                                GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
-                                WS_EX_TRANSPARENT,
-                            };
-                            let ex = GetWindowLongPtrW(HWND(wv as *mut _), GWL_EXSTYLE);
-                            SetWindowLongPtrW(
-                                HWND(wv as *mut _),
-                                GWL_EXSTYLE,
-                                ex | WS_EX_TRANSPARENT.0 as isize,
-                            );
-                        }
-
-                        // Pass the click through — webview is now transparent so
-                        // SysListView32 will receive it as a real mouse event.
-                        return CallNextHookEx(hook_h, code, wparam, lparam);
+                        post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
+                        // Consume: Chrome must not see the click (SetCapture/
+                        // SetFocus would steal the gesture from SysListView32).
+                        return LRESULT(1);
                     }
                 }
 
