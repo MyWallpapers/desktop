@@ -54,12 +54,7 @@
         "devtools": false,
         "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist"
       }
-    ],
-    "trayIcon": {
-      "iconPath": "icons/32x32.png",
-      "iconAsTemplate": true,
-      "menuOnLeftClick": false
-    }
+    ]
   },
   "plugins": {
     "deep-link": {
