@@ -1440,6 +1440,13 @@ pub mod mouse_hook {
                     }
                 }
 
+                // Forward mousemove to SysListView32 for native hover highlight.
+                // PostMessageW is near-free (one kernel call, no cross-process alloc).
+                // The ListView handles hot-tracking internally.
+                if msg == WM_MOUSEMOVE && slv_raw != 0 {
+                    post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
+                }
+
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(HWND(wv_raw as *mut _), &mut cp);
                 forward(msg, &info_hook, cp.x, cp.y);
