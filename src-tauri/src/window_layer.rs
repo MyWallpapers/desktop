@@ -13,6 +13,8 @@ static HOOK_HANDLE_GLOBAL: AtomicIsize = AtomicIsize::new(0);
 static IS_SESSION_ACTIVE: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "windows")]
 static WATCHDOG_PARENT: AtomicIsize = AtomicIsize::new(0);
+#[cfg(target_os = "windows")]
+static INTERFACE_MODE: AtomicBool = AtomicBool::new(false);
 
 // ==============================================================================
 // Public API
@@ -39,12 +41,42 @@ pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, SW_HIDE, SW_SHOW,
+            WS_EX_TRANSPARENT,
+        };
         let slv = mouse_hook::get_syslistview_hwnd();
         if slv != 0 {
             unsafe {
-                // ShowWindow returns BOOL (previous visibility state), not Result
                 let _ = ShowWindow(HWND(slv as *mut _), if visible { SW_SHOW } else { SW_HIDE });
+            }
+        }
+
+        // visible=false → interface mode (icons hidden, UI interactable)
+        // visible=true  → wallpaper mode (icons shown, passthrough logic)
+        let entering_interface = !visible;
+        INTERFACE_MODE.store(entering_interface, Ordering::SeqCst);
+        info!(
+            "[window_layer] Mode switch: {}",
+            if entering_interface { "INTERFACE" } else { "WALLPAPER" }
+        );
+
+        // En mode interface, strip WS_EX_TRANSPARENT immédiatement
+        // pour que le webview reçoive tous les clics.
+        if entering_interface {
+            unsafe {
+                for raw in [
+                    mouse_hook::get_webview_hwnd_raw(),
+                    mouse_hook::get_chrome_rwhh_raw(),
+                ] {
+                    if raw != 0 {
+                        let ex = GetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE);
+                        let new_ex = ex & !(WS_EX_TRANSPARENT.0 as isize);
+                        if new_ex != ex {
+                            SetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE, new_ex);
+                        }
+                    }
+                }
             }
         }
     }
@@ -664,6 +696,12 @@ pub mod mouse_hook {
     pub fn get_dispatch_hwnd() -> isize {
         DISPATCH_HWND.load(Ordering::SeqCst)
     }
+    pub fn get_webview_hwnd_raw() -> isize {
+        WEBVIEW_HWND.load(Ordering::SeqCst)
+    }
+    pub fn get_chrome_rwhh_raw() -> isize {
+        CHROME_RWHH.load(Ordering::SeqCst)
+    }
 
     #[inline]
     unsafe fn post_mouse(kind: i32, vk: i32, data: u32, x: i32, y: i32) {
@@ -914,7 +952,7 @@ pub mod mouse_hook {
         let mut pid = 0u32;
         GetWindowThreadProcessId(slv, Some(&mut pid));
         if pid == 0 {
-            log::info!(
+            log::debug!(
                 "[hit_test] GetWindowThreadProcessId returned pid=0 for slv=0x{:X}",
                 slv.0 as isize
             );
@@ -928,7 +966,7 @@ pub mod mouse_hook {
         ) {
             Ok(h) => h,
             Err(e) => {
-                log::info!("[hit_test] OpenProcess failed for pid={}: {}", pid, e);
+                log::debug!("[hit_test] OpenProcess failed for pid={}: {}", pid, e);
                 return false;
             }
         };
@@ -936,14 +974,14 @@ pub mod mouse_hook {
         let size = std::mem::size_of::<LVHITTESTINFO>();
         let remote = VirtualAllocEx(proc, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if remote.is_null() {
-            log::info!("[hit_test] VirtualAllocEx failed (null), pid={}", pid);
+            log::debug!("[hit_test] VirtualAllocEx failed (null), pid={}", pid);
             let _ = CloseHandle(proc);
             return false;
         }
 
         // Write our struct into explorer's memory
         if WriteProcessMemory(proc, remote, &ht as *const _ as _, size, None).is_err() {
-            log::info!("[hit_test] WriteProcessMemory failed, pid={}", pid);
+            log::debug!("[hit_test] WriteProcessMemory failed, pid={}", pid);
             let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
             let _ = CloseHandle(proc);
             return false;
@@ -974,7 +1012,7 @@ pub mod mouse_hook {
         let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
         let _ = CloseHandle(proc);
 
-        log::info!(
+        log::debug!(
             "[hit_test] screen=({},{}) client=({},{}) send_ret={} msg_result={} read_ok={} i_item={} flags=0x{:X}",
             screen_pt.x,
             screen_pt.y,
@@ -1190,6 +1228,7 @@ pub mod mouse_hook {
                 use windows::Win32::UI::WindowsAndMessaging::{
                     GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
                 };
+                use windows::Win32::Graphics::Gdi::ScreenToClient;
                 let set_icon_passthrough = |on: bool| {
                     for raw in [
                         WEBVIEW_HWND.load(Ordering::Relaxed),
@@ -1215,7 +1254,16 @@ pub mod mouse_hook {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // ── Check if cursor is over a desktop icon ──
+                // ── Interface mode: forward everything to WebView, no hit_test ──
+                if crate::window_layer::INTERFACE_MODE.load(Ordering::Relaxed) {
+                    set_icon_passthrough(false);
+                    let mut cp = info_hook.pt;
+                    let _ = ScreenToClient(HWND(wv_raw as *mut _), &mut cp);
+                    forward(msg, &info_hook, cp.x, cp.y);
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
+
+                // ── Wallpaper mode: check if cursor is over a desktop icon ──
                 let over_icon =
                     slv_raw != 0 && hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt);
 
@@ -1230,7 +1278,6 @@ pub mod mouse_hook {
                 // ── Not over an icon: restore opacity, handle as wallpaper ──
                 set_icon_passthrough(false);
 
-                use windows::Win32::Graphics::Gdi::ScreenToClient;
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(HWND(wv_raw as *mut _), &mut cp);
                 forward(msg, &info_hook, cp.x, cp.y);
