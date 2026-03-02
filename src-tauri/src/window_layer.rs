@@ -663,7 +663,10 @@ pub mod mouse_hook {
     const LVM_GETITEMPOSITION: u32 = LVM_FIRST + 16; // 0x1010
     const LVM_HITTEST: u32 = LVM_FIRST + 18; // 0x1012
     const LVM_GETITEMRECT: u32 = LVM_FIRST + 14; // 0x100E
+    const LVM_SETITEMSTATE: u32 = LVM_FIRST + 43; // 0x102B
     const LVM_SETHOTITEM: u32 = LVM_FIRST + 60; // 0x103C
+    const LVIS_SELECTED: u32 = 0x0002;
+    const LVIS_FOCUSED: u32 = 0x0001;
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -696,6 +699,8 @@ pub mod mouse_hook {
     // Right-click state (context menu — PostMessage doesn't trigger native WM_CONTEXTMENU)
     static RCLICK_ON_ICON: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    static RCLICK_ITEM_INDEX: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(-1);
     // Hover tracking — LVM_SETHOTITEM (PostMessage(WM_MOUSEMOVE) doesn't work
     // because ListView's hot-tracking checks real cursor pos via GetCursorPos)
     static CURRENT_HOT_ITEM: std::sync::atomic::AtomicI32 =
@@ -1209,6 +1214,51 @@ pub mod mouse_hook {
         }
     }
 
+    /// Select + focus a ListView item cross-process via LVM_SETITEMSTATE.
+    /// Deselects all items first, then selects the target.
+    unsafe fn select_listview_item(slv: HWND, item_idx: i32) {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct LvItemState {
+            mask: u32,
+            i_item: i32,
+            i_sub_item: i32,
+            state: u32,
+            state_mask: u32,
+            _padding: [u8; 68], // pad to >= sizeof(LVITEMW) on 64-bit
+        }
+
+        // Deselect all items (wParam = usize::MAX ≡ -1 as UINT_PTR)
+        let desel = LvItemState {
+            mask: 0,
+            i_item: 0,
+            i_sub_item: 0,
+            state: 0,
+            state_mask: LVIS_SELECTED,
+            _padding: [0u8; 68],
+        };
+        let mut out = desel;
+        cross_process_lvm_send(slv, LVM_SETITEMSTATE, WPARAM(usize::MAX), &desel, &mut out);
+
+        // Select + focus the target item
+        let sel = LvItemState {
+            mask: 0,
+            i_item: 0,
+            i_sub_item: 0,
+            state: LVIS_SELECTED | LVIS_FOCUSED,
+            state_mask: LVIS_SELECTED | LVIS_FOCUSED,
+            _padding: [0u8; 68],
+        };
+        let mut out2 = sel;
+        cross_process_lvm_send(
+            slv,
+            LVM_SETITEMSTATE,
+            WPARAM(item_idx as usize),
+            &sel,
+            &mut out2,
+        );
+    }
+
     #[inline]
     unsafe fn forward(msg: u32, info_hook: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
         match msg {
@@ -1380,15 +1430,19 @@ pub mod mouse_hook {
                 let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
 
-                // ── Right-click on icon: context menu tracking ──
-                // PostMessage doesn't trigger the shell's WM_CONTEXTMENU synthesis,
-                // so we post it explicitly after WM_RBUTTONUP.
+                // ── Right-click on icon: context menu ──
+                // PostMessage(WM_RBUTTONDOWN) doesn't reliably select the item
+                // (ListView checks GetCursorPos, sees Chrome_RWHH). Instead:
+                // explicit LVM_SETITEMSTATE (sync) then WM_CONTEXTMENU (async).
                 if RCLICK_ON_ICON.load(Ordering::Relaxed) {
                     if msg == WM_RBUTTONUP {
                         RCLICK_ON_ICON.store(false, Ordering::Relaxed);
                         if slv_raw != 0 {
                             let slv_h = HWND(slv_raw as *mut _);
-                            post_to_slv(slv_h, msg, &info_hook);
+                            let item_idx = RCLICK_ITEM_INDEX.load(Ordering::Relaxed);
+                            if item_idx >= 0 {
+                                select_listview_item(slv_h, item_idx);
+                            }
                             let ctx_lp = ((info_hook.pt.x as i16 as u16 as u32)
                                 | ((info_hook.pt.y as i16 as u16 as u32) << 16))
                                 as isize;
@@ -1400,7 +1454,6 @@ pub mod mouse_hook {
                             );
                         }
                     } else if msg != WM_MOUSEMOVE {
-                        // Unexpected button event → cancel right-click, fall through
                         RCLICK_ON_ICON.store(false, Ordering::Relaxed);
                     }
                     return CallNextHookEx(hook_h, code, wparam, lparam);
@@ -1546,11 +1599,19 @@ pub mod mouse_hook {
                                 DRAG_OFFSET_Y.load(Ordering::Relaxed),
                             );
                         } else {
-                            // Right-click: track for context menu
+                            // Right-click: track for context menu + store item index
                             RCLICK_ON_ICON.store(true, Ordering::Relaxed);
+                            let item_idx = get_hit_item_index(slv_h, &info_hook.pt);
+                            RCLICK_ITEM_INDEX.store(item_idx, Ordering::Relaxed);
                         }
 
-                        post_to_slv(slv_h, msg, &info_hook);
+                        // Only post WM_LBUTTONDOWN to SysListView32 (for drag init).
+                        // WM_RBUTTONDOWN is NOT posted: its selection is unreliable
+                        // (ListView calls GetCursorPos → sees Chrome_RWHH).
+                        // Right-click selection is done via LVM_SETITEMSTATE on button-up.
+                        if msg == WM_LBUTTONDOWN {
+                            post_to_slv(slv_h, msg, &info_hook);
+                        }
                         return CallNextHookEx(hook_h, code, wparam, lparam);
                     }
                 }
