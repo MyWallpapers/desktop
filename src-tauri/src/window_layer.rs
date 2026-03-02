@@ -1254,29 +1254,23 @@ pub mod mouse_hook {
                 let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
 
-                // ── Active native drag (icon): hybride post_to_slv + CallNextHookEx ──
+                // ── Active native drag (icon): pur CallNextHookEx ──
+                // Chrome_RWHH a WS_EX_TRANSPARENT → hardware messages passent à travers
+                // via WM_NCHITTEST(HTTRANSPARENT) → XamlExplorer/SysListView32 les reçoit.
+                // PAS de post_to_slv (PostMessage ne met pas à jour GetKeyState →
+                // LISTVIEW_TrackMouse ne détecte pas le drag).
                 if NATIVE_DRAG.load(Ordering::Relaxed) {
                     if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
                         NATIVE_DRAG.store(false, Ordering::Relaxed);
                         log::info!("[hook] NATIVE_DRAG end (button-up) at ({},{})", info_hook.pt.x, info_hook.pt.y);
-                        if slv_raw != 0 {
-                            post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
-                        }
                     } else if msg == WM_MOUSEMOVE {
-                        // Compteur de mousemove pendant le drag
                         static DRAG_MOVE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                         let c = DRAG_MOVE_COUNT.fetch_add(1, Ordering::Relaxed);
                         if c == 0 || c % 20 == 0 {
-                            // Log l'hwnd qui va recevoir le hardware message
                             log::info!(
                                 "[hook] NATIVE_DRAG move #{} at ({},{}) hwnd_under={:#x?}",
                                 c, info_hook.pt.x, info_hook.pt.y, hwnd_under.0
                             );
-                        }
-                    } else {
-                        log::info!("[hook] NATIVE_DRAG event msg={:#x} at ({},{})", msg, info_hook.pt.x, info_hook.pt.y);
-                        if slv_raw != 0 {
-                            post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                         }
                     }
                     return CallNextHookEx(hook_h, code, wparam, lparam);
@@ -1321,18 +1315,24 @@ pub mod mouse_hook {
                 }
 
                 // ── Wallpaper mode: button-down on icon → NATIVE_DRAG ──
-                // post_to_slv pour le clic initial (nécessaire: XamlExplorer ne forwarde pas)
-                // Le drag fonctionnera car: post_to_slv envoie WM_LBUTTONDOWN → SysListView32
-                // entre dans LISTVIEW_TrackMouse → SetCapture → les WM_MOUSEMOVE hardware
-                // (via CallNextHookEx) sont capturés par SysListView32 pour détecter le drag.
+                // Pur CallNextHookEx: Chrome_RWHH a WS_EX_TRANSPARENT, donc les
+                // hardware messages passent à travers vers XamlExplorer/SysListView32.
+                // Pas de post_to_slv: ça ne met pas à jour GetKeyState, bloque le drag.
                 if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) && slv_raw != 0 {
                     if hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt) {
                         NATIVE_DRAG.store(true, Ordering::Relaxed);
+                        // Vérifier l'état de WS_EX_TRANSPARENT sur Chrome_RWHH
+                        let rwhh = CHROME_RWHH.load(Ordering::Relaxed);
+                        let has_trans = if rwhh != 0 {
+                            let ex = GetWindowLongPtrW(HWND(rwhh as *mut _), GWL_EXSTYLE);
+                            (ex & (WS_EX_TRANSPARENT.0 as isize)) != 0
+                        } else {
+                            false
+                        };
                         log::info!(
-                            "[hook] NATIVE_DRAG start at ({},{}) msg={:#x} slv={:#x}",
-                            info_hook.pt.x, info_hook.pt.y, msg, slv_raw
+                            "[hook] NATIVE_DRAG start at ({},{}) msg={:#x} rwhh_transparent={}",
+                            info_hook.pt.x, info_hook.pt.y, msg, has_trans
                         );
-                        post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                         return CallNextHookEx(hook_h, code, wparam, lparam);
                     }
                 }
