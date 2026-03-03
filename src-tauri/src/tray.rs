@@ -4,7 +4,7 @@ use log::{error, info};
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
-    tray::{TrayIconBuilder, TrayIconEvent},
+    tray::TrayIconBuilder,
     AppHandle, Manager,
 };
 
@@ -25,18 +25,6 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             if event.id().as_ref() == "quit" {
                 crate::window_layer::restore_desktop_icons_and_unhook();
                 app.exit(0);
-            }
-        })
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: tauri::tray::MouseButton::Left,
-                ..
-            } = event
-            {
-                if let Some(window) = tray.app_handle().get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
             }
         })
         .build(app)?;
