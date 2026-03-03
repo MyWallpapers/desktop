@@ -41,6 +41,8 @@ features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Media_Audio",
     "Win32_UI_Accessibility",
     "Win32_System_Variant",
     "Win32_System_Com",

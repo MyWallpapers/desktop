@@ -1,7 +1,7 @@
 //! System data collection for widget consumption.
 //!
-//! Provides one-shot and real-time system metrics (CPU, memory, battery, disk, network)
-//! that the frontend filters per-widget based on manifest permissions.
+//! Provides one-shot and real-time system metrics (CPU, memory, battery, disk, network,
+//! GPU, display, audio, uptime) that the frontend filters per-widget based on manifest permissions.
 
 use log::{error, info};
 use serde::Serialize;
@@ -30,6 +30,15 @@ pub struct SystemData {
     pub network: Option<Vec<NetworkInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media: Option<crate::media::MediaInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<Vec<DisplayInfo>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioInfo>,
+    /// Seconds since system boot
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime: Option<u64>,
 }
 
 #[typeshare]
@@ -93,6 +102,53 @@ pub struct NetworkInfo {
     pub transmitted: u64,
 }
 
+#[typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuInfo {
+    /// GPU name (e.g., "NVIDIA GeForce RTX 4090")
+    pub name: String,
+    /// VRAM in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vram: Option<u64>,
+    /// GPU usage percentage (0-100)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<f32>,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayInfo {
+    /// Display name/model
+    pub name: String,
+    /// Width in pixels
+    pub width: u32,
+    /// Height in pixels
+    pub height: u32,
+    /// Refresh rate in Hz
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_rate: Option<u32>,
+    /// Scale factor / DPI multiplier (e.g., 1.0, 1.25, 1.5, 2.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale_factor: Option<f32>,
+    /// Whether this is the primary display
+    pub primary: bool,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioInfo {
+    /// System volume level (0.0 - 1.0)
+    pub volume: f32,
+    /// Whether the system audio is muted
+    pub muted: bool,
+    /// Name of the current output device
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_device: Option<String>,
+}
+
 // ============================================================================
 // Monitor State
 // ============================================================================
@@ -110,7 +166,6 @@ static POLL_CATEGORIES: LazyLock<Arc<Mutex<Vec<String>>>> =
 pub fn collect_system_data(categories: &[String]) -> SystemData {
     let mut sys = sysinfo::System::new();
 
-    // CPU needs two refreshes with a gap for accurate readings (no prior baseline)
     if categories.iter().any(|c| c == "cpu") {
         sys.refresh_cpu_usage();
         std::thread::sleep(Duration::from_millis(200));
@@ -151,21 +206,171 @@ fn collect_battery_info() -> Option<BatteryInfo> {
 }
 
 // ============================================================================
+// GPU — DXGI (Windows)
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+fn collect_gpu_info() -> Option<GpuInfo> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let adapter = factory.EnumAdapters1(0).ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+
+        let name = String::from_utf16_lossy(&desc.Description)
+            .trim_end_matches('\0')
+            .to_string();
+
+        Some(GpuInfo {
+            name,
+            vram: Some(desc.DedicatedVideoMemory as u64),
+            usage: None, // DXGI doesn't expose real-time GPU usage
+        })
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn collect_gpu_info() -> Option<GpuInfo> {
+    None
+}
+
+// ============================================================================
+// Display — GDI (Windows)
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+fn collect_display_info() -> Option<Vec<DisplayInfo>> {
+    use std::mem::{size_of, zeroed};
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayDevicesW, EnumDisplaySettingsW, DEVMODEW, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
+    };
+    use windows::Win32::UI::HiDpi::GetDpiForSystem;
+
+    unsafe {
+        let mut displays = Vec::new();
+        let mut idx = 0u32;
+
+        loop {
+            let mut dd: DISPLAY_DEVICEW = zeroed();
+            dd.cb = size_of::<DISPLAY_DEVICEW>() as u32;
+
+            if !EnumDisplayDevicesW(PCWSTR::null(), idx, &mut dd, 0).as_bool() {
+                break;
+            }
+
+            // Only active displays
+            if dd.StateFlags & 1 != 0 {
+                // DISPLAY_DEVICE_ACTIVE
+                let adapter_name = PCWSTR(dd.DeviceName.as_ptr());
+                let mut dm: DEVMODEW = zeroed();
+                dm.dmSize = size_of::<DEVMODEW>() as u16;
+
+                if EnumDisplaySettingsW(adapter_name, ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
+                    // Try getting the monitor name (second-level enumeration)
+                    let mut monitor: DISPLAY_DEVICEW = zeroed();
+                    monitor.cb = size_of::<DISPLAY_DEVICEW>() as u32;
+                    let name = if EnumDisplayDevicesW(adapter_name, 0, &mut monitor, 0).as_bool() {
+                        String::from_utf16_lossy(&monitor.DeviceString)
+                            .trim_end_matches('\0')
+                            .to_string()
+                    } else {
+                        String::from_utf16_lossy(&dd.DeviceString)
+                            .trim_end_matches('\0')
+                            .to_string()
+                    };
+
+                    let primary = dd.StateFlags & 4 != 0; // DISPLAY_DEVICE_PRIMARY_DEVICE
+
+                    displays.push(DisplayInfo {
+                        name,
+                        width: dm.dmPelsWidth,
+                        height: dm.dmPelsHeight,
+                        refresh_rate: if dm.dmDisplayFrequency > 0 {
+                            Some(dm.dmDisplayFrequency)
+                        } else {
+                            None
+                        },
+                        scale_factor: None, // Set below
+                        primary,
+                    });
+                }
+            }
+
+            idx += 1;
+        }
+
+        // Apply system DPI as scale factor
+        let dpi = GetDpiForSystem();
+        let scale = dpi as f32 / 96.0;
+        for d in &mut displays {
+            d.scale_factor = Some(scale);
+        }
+
+        if displays.is_empty() {
+            None
+        } else {
+            Some(displays)
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn collect_display_info() -> Option<Vec<DisplayInfo>> {
+    None
+}
+
+// ============================================================================
+// Audio — WASAPI (Windows)
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+fn collect_audio_info() -> Option<AudioInfo> {
+    use windows::Win32::Media::Audio::{
+        eMultimedia, eRender, IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
+
+    unsafe {
+        // Ensure COM is initialized for this thread (no-op if already done)
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eRender, eMultimedia)
+            .ok()?;
+        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None).ok()?;
+
+        let level = volume.GetMasterVolumeLevelScalar().ok()?;
+        let muted = volume.GetMute().ok()?.as_bool();
+
+        Some(AudioInfo {
+            volume: level,
+            muted,
+            output_device: None, // Requires IPropertyStore + PKEY_Device_FriendlyName
+        })
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn collect_audio_info() -> Option<AudioInfo> {
+    None
+}
+
+// ============================================================================
 // Background Monitor
 // ============================================================================
 
 /// Collect system data using a reusable System instance (for the background monitor).
 fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> SystemData {
     let mut data = SystemData::default();
+    let needs = |cat: &str| categories.iter().any(|c| c == cat);
 
-    let needs_cpu = categories.iter().any(|c| c == "cpu");
-    let needs_memory = categories.iter().any(|c| c == "memory");
-    let needs_disk = categories.iter().any(|c| c == "disk");
-    let needs_network = categories.iter().any(|c| c == "network");
-    let needs_battery = categories.iter().any(|c| c == "battery");
-    let needs_media = categories.iter().any(|c| c == "media");
-
-    if needs_cpu {
+    if needs("cpu") {
         sys.refresh_cpu_usage();
 
         let cpus = sys.cpus();
@@ -186,7 +391,7 @@ fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> Syst
         });
     }
 
-    if needs_memory {
+    if needs("memory") {
         sys.refresh_memory();
         data.memory = Some(MemoryInfo {
             total: sys.total_memory(),
@@ -195,7 +400,7 @@ fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> Syst
         });
     }
 
-    if needs_disk {
+    if needs("disk") {
         let disks = sysinfo::Disks::new_with_refreshed_list();
         data.disk = Some(
             disks
@@ -210,7 +415,7 @@ fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> Syst
         );
     }
 
-    if needs_network {
+    if needs("network") {
         let networks = sysinfo::Networks::new_with_refreshed_list();
         data.network = Some(
             networks
@@ -224,12 +429,23 @@ fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> Syst
         );
     }
 
-    if needs_battery {
+    if needs("battery") {
         data.battery = collect_battery_info();
     }
-
-    if needs_media {
+    if needs("media") {
         data.media = crate::media::get_media_info().ok();
+    }
+    if needs("gpu") {
+        data.gpu = collect_gpu_info();
+    }
+    if needs("display") {
+        data.display = collect_display_info();
+    }
+    if needs("audio") {
+        data.audio = collect_audio_info();
+    }
+    if needs("uptime") {
+        data.uptime = Some(sysinfo::System::uptime());
     }
 
     data

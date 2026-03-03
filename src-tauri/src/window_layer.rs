@@ -677,10 +677,7 @@ pub mod mouse_hook {
     const LVM_GETITEMPOSITION: u32 = LVM_FIRST + 16; // 0x1010
     const LVM_HITTEST: u32 = LVM_FIRST + 18; // 0x1012
     const LVM_GETITEMRECT: u32 = LVM_FIRST + 14; // 0x100E
-    const LVM_SETITEMSTATE: u32 = LVM_FIRST + 43; // 0x102B
     const LVM_SETHOTITEM: u32 = LVM_FIRST + 60; // 0x103C
-    const LVIS_SELECTED: u32 = 0x0002;
-    const LVIS_FOCUSED: u32 = 0x0001;
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -1289,51 +1286,6 @@ pub mod mouse_hook {
         }
     }
 
-    /// Select + focus a ListView item cross-process via LVM_SETITEMSTATE.
-    /// Deselects all items first, then selects the target.
-    unsafe fn select_listview_item(slv: HWND, item_idx: i32) {
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct LvItemState {
-            mask: u32,
-            i_item: i32,
-            i_sub_item: i32,
-            state: u32,
-            state_mask: u32,
-            _padding: [u8; 68], // pad to >= sizeof(LVITEMW) on 64-bit
-        }
-
-        // Deselect all items (wParam = usize::MAX ≡ -1 as UINT_PTR)
-        let desel = LvItemState {
-            mask: 0,
-            i_item: 0,
-            i_sub_item: 0,
-            state: 0,
-            state_mask: LVIS_SELECTED,
-            _padding: [0u8; 68],
-        };
-        let mut out = desel;
-        cross_process_lvm_send(slv, LVM_SETITEMSTATE, WPARAM(usize::MAX), &desel, &mut out);
-
-        // Select + focus the target item
-        let sel = LvItemState {
-            mask: 0,
-            i_item: 0,
-            i_sub_item: 0,
-            state: LVIS_SELECTED | LVIS_FOCUSED,
-            state_mask: LVIS_SELECTED | LVIS_FOCUSED,
-            _padding: [0u8; 68],
-        };
-        let mut out2 = sel;
-        cross_process_lvm_send(
-            slv,
-            LVM_SETITEMSTATE,
-            WPARAM(item_idx as usize),
-            &sel,
-            &mut out2,
-        );
-    }
-
     #[inline]
     unsafe fn forward(msg: u32, info_hook: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
         match msg {
@@ -1706,10 +1658,8 @@ pub mod mouse_hook {
                     }
                 }
 
-                // Hover highlight via LVM_SETHOTITEM (throttled to ~30ms).
-                // PostMessage(WM_MOUSEMOVE) doesn't work because ListView's
-                // hot-tracking calls GetCursorPos and sees cursor over Chrome_RWHH.
-                // Instead: cross-process LVM_HITTEST → LVM_SETHOTITEM.
+                // Hover highlight: cross-process LVM_HITTEST → PostMessage LVM_SETHOTITEM (50ms throttle).
+                // PostMessage(WM_MOUSEMOVE) fails because ListView hot-tracking calls GetCursorPos.
                 if msg == WM_MOUSEMOVE && slv_raw != 0 {
                     let now = windows::Win32::System::SystemInformation::GetTickCount64();
                     let last = LAST_HOVER_TICK.load(Ordering::Relaxed);
@@ -1719,15 +1669,11 @@ pub mod mouse_hook {
                         let item = get_hit_item_index(slv_h, &info_hook.pt);
                         let prev = CURRENT_HOT_ITEM.swap(item, Ordering::Relaxed);
                         if item != prev {
-                            // wParam = item index (-1 clears hot item)
-                            let _ = SendMessageTimeoutW(
+                            let _ = PostMessageW(
                                 slv_h,
                                 LVM_SETHOTITEM,
                                 WPARAM(item as i32 as u32 as usize),
                                 LPARAM(0),
-                                SMTO_ABORTIFHUNG,
-                                50,
-                                None,
                             );
                         }
                     }

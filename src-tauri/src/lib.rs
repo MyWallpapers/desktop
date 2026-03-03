@@ -3,7 +3,6 @@
 //! Tauri backend for the MyWallpaper animated wallpaper application.
 
 mod commands;
-mod commands_core;
 mod discord;
 pub mod error;
 pub mod events;
@@ -28,31 +27,22 @@ static MW_INIT_SCRIPT: LazyLock<String> = LazyLock::new(|| {
 });
 
 pub fn main() {
-    // Clean up old log files, keeping the most recent ones for forensics.
+    // Keep at most 5 log files, delete older ones.
     #[cfg(target_os = "windows")]
-    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
-        const MAX_LOG_FILES: usize = 5;
-        let base = std::path::Path::new(&local_appdata);
+    if let Some(base) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
         let log_dir = base.join("com.mywallpaper.desktop").join("logs");
-        // Resolve symlinks and verify the log dir is still under LOCALAPPDATA
-        if let (Ok(canonical_dir), Ok(canonical_base)) =
-            (log_dir.canonicalize(), base.canonicalize())
-        {
-            if canonical_dir.starts_with(&canonical_base) {
-                if let Ok(entries) = std::fs::read_dir(&canonical_dir) {
-                    let mut logs: Vec<_> = entries
-                        .flatten()
-                        .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
-                        .filter_map(|e| {
-                            let modified = e.metadata().ok()?.modified().ok()?;
-                            Some((e.path(), modified))
-                        })
-                        .collect();
-                    // Sort newest first, delete everything beyond the retention limit
+        if let Ok(canonical) = log_dir.canonicalize() {
+            if canonical.starts_with(base.canonicalize().unwrap_or_default()) {
+                if let Ok(mut logs) = std::fs::read_dir(&canonical).map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
+                        .filter_map(|e| Some((e.path(), e.metadata().ok()?.modified().ok()?)))
+                        .collect::<Vec<_>>()
+                }) {
                     logs.sort_by(|a, b| b.1.cmp(&a.1));
-                    for (path, _) in logs.into_iter().skip(MAX_LOG_FILES) {
-                        let _ = std::fs::remove_file(path);
-                    }
+                    logs.into_iter().skip(5).for_each(|(p, _)| {
+                        let _ = std::fs::remove_file(p);
+                    });
                 }
             }
         }
@@ -102,7 +92,7 @@ fn start_with_tauri_webview() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             args.into_iter()
-                .filter_map(|a| commands_core::validate_deep_link(&a))
+                .filter_map(|a| commands::validate_deep_link(&a))
                 .for_each(|url| {
                     let _ = app.emit_app_event(&AppEvent::DeepLink { url });
                 });
@@ -137,7 +127,7 @@ fn start_with_tauri_webview() {
             app.listen("deep-link://new-url", move |event| {
                 if let Ok(urls) = serde_json::from_str::<Vec<String>>(event.payload()) {
                     urls.into_iter()
-                        .filter_map(|u| commands_core::validate_deep_link(&u))
+                        .filter_map(|u| commands::validate_deep_link(&u))
                         .for_each(|url| {
                             let _ = deep_link_handle.emit_app_event(&AppEvent::DeepLink { url });
                         });
