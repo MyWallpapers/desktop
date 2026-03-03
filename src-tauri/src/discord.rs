@@ -43,11 +43,12 @@ pub fn init() {
 
 /// Update the Discord Rich Presence activity.
 pub fn update_presence(details: &str, state: &str) -> AppResult<()> {
-    let mut guard = CLIENT.lock().unwrap();
-    if let Some(ref mut client) = *guard {
-        client
-            .set_activity(build_activity(details, state))
-            .map_err(|e| AppError::Discord(e.to_string()))?;
+    if let Ok(mut guard) = CLIENT.lock() {
+        if let Some(ref mut client) = *guard {
+            client
+                .set_activity(build_activity(details, state))
+                .map_err(|e| AppError::Discord(e.to_string()))?;
+        }
     }
     Ok(())
 }

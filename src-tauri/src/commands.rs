@@ -36,18 +36,6 @@ pub struct UpdateInfo {
 // Validation
 // ============================================================================
 
-const VALID_CATEGORIES: &[&str] = &[
-    "cpu", "memory", "battery", "disk", "network", "media", "gpu", "display", "audio", "uptime",
-];
-
-fn validate_categories(categories: &[String]) -> Vec<String> {
-    categories
-        .iter()
-        .filter(|c| VALID_CATEGORIES.contains(&c.as_str()))
-        .cloned()
-        .collect()
-}
-
 /// Parse and validate the updater endpoint URL, returning the parsed URL on success.
 fn validate_updater_endpoint(url: &str) -> AppResult<url::Url> {
     let parsed =
@@ -185,12 +173,12 @@ pub fn get_system_info() -> SystemInfo {
 
 #[tauri::command]
 pub fn get_system_data(categories: Vec<String>) -> system_monitor::SystemData {
-    system_monitor::collect_system_data(&validate_categories(&categories))
+    system_monitor::collect_system_data(system_monitor::parse_categories(&categories))
 }
 
 #[tauri::command]
 pub fn subscribe_system_data(categories: Vec<String>) {
-    system_monitor::set_poll_categories(validate_categories(&categories));
+    system_monitor::set_poll_mask(system_monitor::parse_categories(&categories));
 }
 
 fn build_updater(

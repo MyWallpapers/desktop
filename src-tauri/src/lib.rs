@@ -14,12 +14,16 @@ mod window_layer;
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 // Timing constants for the WebView heartbeat watchdog
 const HEARTBEAT_GRACE_SECS: u64 = 30;
 const HEARTBEAT_POLL_SECS: u64 = 5;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 15;
 const MONITOR_INTERVAL_SECS: u64 = 3;
+
+// Monotonic clock anchor — immune to NTP syncs, DST adjustments, and manual clock changes.
+static START_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 static MW_INIT_SCRIPT: LazyLock<String> = LazyLock::new(|| {
     format!(
@@ -32,11 +36,8 @@ static MW_INIT_SCRIPT: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-fn unix_secs() -> u64 {
-    std::time::UNIX_EPOCH
-        .elapsed()
-        .unwrap_or_default()
-        .as_secs()
+fn monotonic_secs() -> u64 {
+    START_TIME.elapsed().as_secs()
 }
 
 /// Keep at most 5 log files, delete older ones.
@@ -166,10 +167,10 @@ fn start_with_tauri_webview() {
             discord::init();
 
             // WebView heartbeat watchdog — auto-reload if frontend stops responding
-            let last_heartbeat = Arc::new(AtomicU64::new(unix_secs()));
+            let last_heartbeat = Arc::new(AtomicU64::new(monotonic_secs()));
             let hb = last_heartbeat.clone();
             handle.listen("webview-heartbeat", move |_| {
-                hb.store(unix_secs(), Ordering::Relaxed);
+                hb.store(monotonic_secs(), Ordering::Relaxed);
             });
 
             let hb_handle = handle.clone();
@@ -181,12 +182,12 @@ fn start_with_tauri_webview() {
                 std::thread::sleep(Duration::from_secs(HEARTBEAT_GRACE_SECS));
                 loop {
                     std::thread::sleep(Duration::from_secs(HEARTBEAT_POLL_SECS));
-                    let elapsed = unix_secs() - hb_ref.load(Ordering::Relaxed);
+                    let elapsed = monotonic_secs() - hb_ref.load(Ordering::Relaxed);
                     if elapsed > HEARTBEAT_TIMEOUT_SECS {
                         warn!("[heartbeat] WebView unresponsive ({}s), reloading", elapsed);
                         if let Some(w) = hb_handle.get_webview_window("main") {
                             let _ = w.eval("window.location.reload()");
-                            hb_ref.store(unix_secs(), Ordering::Relaxed);
+                            hb_ref.store(monotonic_secs(), Ordering::Relaxed);
                         }
                     }
                 }

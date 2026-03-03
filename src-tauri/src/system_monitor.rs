@@ -5,8 +5,7 @@
 
 use log::{error, info};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use typeshare::typeshare;
 
@@ -153,24 +152,55 @@ pub struct AudioInfo {
 // Monitor State
 // ============================================================================
 
+// Bitmask constants for each data category (no heap allocation, no lock)
+pub const MASK_CPU: u32 = 1 << 0;
+pub const MASK_MEMORY: u32 = 1 << 1;
+pub const MASK_BATTERY: u32 = 1 << 2;
+pub const MASK_DISK: u32 = 1 << 3;
+pub const MASK_NETWORK: u32 = 1 << 4;
+pub const MASK_MEDIA: u32 = 1 << 5;
+pub const MASK_GPU: u32 = 1 << 6;
+pub const MASK_DISPLAY: u32 = 1 << 7;
+pub const MASK_AUDIO: u32 = 1 << 8;
+pub const MASK_UPTIME: u32 = 1 << 9;
+
 static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
-static POLL_CATEGORIES: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static POLL_MASK: AtomicU32 = AtomicU32::new(0);
 
 // ============================================================================
 // Data Collection
 // ============================================================================
 
-/// Collect system data for the requested categories (one-shot).
-/// One-shot collection: creates a temporary System, primes CPU baseline, then delegates.
-pub fn collect_system_data(categories: &[String]) -> SystemData {
+/// Convert a slice of category name strings to an AtomicU32-compatible bitmask.
+/// Unknown names are silently ignored (contribute 0).
+pub fn parse_categories(categories: &[String]) -> u32 {
+    categories.iter().fold(0u32, |acc, c| {
+        acc | match c.as_str() {
+            "cpu" => MASK_CPU,
+            "memory" => MASK_MEMORY,
+            "battery" => MASK_BATTERY,
+            "disk" => MASK_DISK,
+            "network" => MASK_NETWORK,
+            "media" => MASK_MEDIA,
+            "gpu" => MASK_GPU,
+            "display" => MASK_DISPLAY,
+            "audio" => MASK_AUDIO,
+            "uptime" => MASK_UPTIME,
+            _ => 0,
+        }
+    })
+}
+
+/// Collect system data for the requested category bitmask (one-shot).
+pub fn collect_system_data(mask: u32) -> SystemData {
     let mut sys = sysinfo::System::new();
 
-    if categories.iter().any(|c| c == "cpu") {
+    if mask & MASK_CPU != 0 {
         sys.refresh_cpu_usage();
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    collect_with_system(&mut sys, categories)
+    collect_with_system(&mut sys, mask)
 }
 
 /// Collect battery info. Returns None on desktops without a battery.
@@ -381,11 +411,10 @@ fn collect_audio_info() -> Option<AudioInfo> {
 // ============================================================================
 
 /// Collect system data using a reusable System instance (for the background monitor).
-fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> SystemData {
+fn collect_with_system(sys: &mut sysinfo::System, mask: u32) -> SystemData {
     let mut data = SystemData::default();
-    let needs = |cat: &str| categories.iter().any(|c| c == cat);
 
-    if needs("cpu") {
+    if mask & MASK_CPU != 0 {
         sys.refresh_cpu_usage();
 
         let cpus = sys.cpus();
@@ -406,7 +435,7 @@ fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> Syst
         });
     }
 
-    if needs("memory") {
+    if mask & MASK_MEMORY != 0 {
         sys.refresh_memory();
         data.memory = Some(MemoryInfo {
             total: sys.total_memory(),
@@ -415,7 +444,7 @@ fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> Syst
         });
     }
 
-    if needs("disk") {
+    if mask & MASK_DISK != 0 {
         let disks = sysinfo::Disks::new_with_refreshed_list();
         data.disk = Some(
             disks
@@ -430,7 +459,7 @@ fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> Syst
         );
     }
 
-    if needs("network") {
+    if mask & MASK_NETWORK != 0 {
         let networks = sysinfo::Networks::new_with_refreshed_list();
         data.network = Some(
             networks
@@ -444,22 +473,22 @@ fn collect_with_system(sys: &mut sysinfo::System, categories: &[String]) -> Syst
         );
     }
 
-    if needs("battery") {
+    if mask & MASK_BATTERY != 0 {
         data.battery = collect_battery_info();
     }
-    if needs("media") {
+    if mask & MASK_MEDIA != 0 {
         data.media = crate::media::get_media_info().ok();
     }
-    if needs("gpu") {
+    if mask & MASK_GPU != 0 {
         data.gpu = collect_gpu_info();
     }
-    if needs("display") {
+    if mask & MASK_DISPLAY != 0 {
         data.display = collect_display_info();
     }
-    if needs("audio") {
+    if mask & MASK_AUDIO != 0 {
         data.audio = collect_audio_info();
     }
-    if needs("uptime") {
+    if mask & MASK_UPTIME != 0 {
         data.uptime = Some(sysinfo::System::uptime());
     }
 
@@ -489,15 +518,14 @@ pub fn start_monitor(app_handle: tauri::AppHandle, interval_secs: u64) {
         let interval = Duration::from_secs(interval_secs);
 
         while MONITOR_RUNNING.load(Ordering::SeqCst) {
-            let categories = POLL_CATEGORIES.lock().unwrap().clone();
+            let mask = POLL_MASK.load(Ordering::Relaxed);
 
-            if categories.is_empty() {
-                // Rien à poller, on dort et on réessaie
+            if mask == 0 {
                 std::thread::sleep(interval);
                 continue;
             }
 
-            let data = collect_with_system(&mut sys, &categories);
+            let data = collect_with_system(&mut sys, mask);
 
             let event = AppEvent::SystemDataUpdate(Box::new(data));
             if let Err(e) = app_handle.emit_app_event(&event) {
@@ -511,8 +539,8 @@ pub fn start_monitor(app_handle: tauri::AppHandle, interval_secs: u64) {
     });
 }
 
-/// Update the categories the monitor polls. Pass empty to pause polling.
-pub fn set_poll_categories(categories: Vec<String>) {
-    info!("[system_monitor] Poll categories updated: {:?}", categories);
-    *POLL_CATEGORIES.lock().unwrap() = categories;
+/// Update the poll bitmask. Pass 0 to pause polling.
+pub fn set_poll_mask(mask: u32) {
+    info!("[system_monitor] Poll mask updated: {:#b}", mask);
+    POLL_MASK.store(mask, Ordering::Relaxed);
 }

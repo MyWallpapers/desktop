@@ -1054,11 +1054,11 @@ pub mod mouse_hook {
         if hwnd_under == tp || hwnd_under == wv || hwnd_under == pm {
             return true;
         }
-        if !pm.is_invalid() && IsChild(pm, hwnd_under).as_bool() {
+        if pm.0 as isize != 0 && IsChild(pm, hwnd_under).as_bool() {
             return true;
         }
         // Also check if hwnd_under is a child of the target parent (WorkerW)
-        if !tp.is_invalid() && IsChild(tp, hwnd_under).as_bool() {
+        if tp.0 as isize != 0 && IsChild(tp, hwnd_under).as_bool() {
             return true;
         }
 
